@@ -1,0 +1,35 @@
+<!-- 
+    CHRONOSAI: ANDROID MANIFEST INTEGRATION SNIPPET
+    
+    1. Paste the <uses-permission> entries outside of your <application> tag.
+    2. Paste the <service> entry inside of your <application> tag.
+-->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 6.4 Manifest Permissions Required for WebRTC Audio Voice Stream -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    
+    <!-- Required to prevent service background throttling on Android 9+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    
+    <!-- Required specifically on Android 14+ to declare a foreground microphone connection -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <application>
+        
+        <!-- 
+            Register the LiveKit WebRTC Foreground Service.
+            Declaring serviceType is critical for Android 14 (API 34) compliance!
+        -->
+        <service
+            android:name="com.example.android_integration.VoiceReceiverService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+    </application>
+
+</manifest>
