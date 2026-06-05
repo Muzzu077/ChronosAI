@@ -31,8 +31,8 @@ class ApiClient {
     companion object {
         private const val TAG = "ApiClient"
 
-        // Android emulator loopback to the host running FastAPI.
-        private const val BASE_URL = "http://10.0.2.2:8080"
+        // Redirected via adb reverse for physical USB devices.
+        private const val BASE_URL = "http://127.0.0.1:8080"
     }
 
     suspend fun fetchLiveKitSession(userId: String): LiveKitSessionDto = withContext(Dispatchers.IO) {
