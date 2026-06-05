@@ -123,9 +123,5 @@ dependencies {
   
   // ChronosAI Dependencies
   implementation("io.livekit:livekit-android:1.5.0")
-  implementation("io.github.jan-tennert.supabase:auth-kt:3.0.0-rc-1")
-  implementation("io.github.jan-tennert.supabase:postgrest-kt:3.0.0-rc-1")
-  implementation("io.ktor:ktor-client-android:3.0.0")
-  implementation("io.ktor:ktor-client-core:3.0.0")
 }
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }

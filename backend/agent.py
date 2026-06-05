@@ -55,11 +55,8 @@ async def entrypoint(ctx: JobContext):
         f"- Call 'schedule_reminder' whenever the user wants to add, book, or log an entry. You MUST supply the user_id EXACTLY as '{user_id}'.\n"
         "- Be meticulous about converting user terms like '2:30 PM' relative to the base date and format them correctly into ISO-8601 UTC strings."
     )
-    ...
-    # Initial greeting via TTS
-    await agent.say("Hello, I am ChronosAI. Neural Link successfully establishing. I am ready to schedule your timeline.", allow_interruptions=True)
-        text=system_prompt
-    )
+    initial_ctx = llm.ChatContext()
+    initial_ctx.append(role="system", text=system_prompt)
     
     # Cognitive AI Engine utilizing OpenRouter OpenAO-compatible model
     openrouter_llm = openai.LLM(
@@ -109,7 +106,7 @@ async def entrypoint(ctx: JobContext):
             print(f"Data receive error: {e}")
     
     # Initial greeting via TTS
-    await agent.say("Hello, I am Nightcrawler. Neural Link successfully establishing. I am ready to schedule your timeline.", allow_interruptions=True)
+    await agent.say("Hello, I am ChronosAI. I am ready to plan your day.", allow_interruptions=True)
 
 if __name__ == "__main__":
     # Start the standalone LiveKit worker agent process

@@ -3,70 +3,130 @@ package com.example.android_integration
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
+import java.net.URLEncoder
 import java.net.URL
 
-/**
- * ApiClient: Handles synchronization and communication with the FastAPI API Gateway.
- * It connects to the host machine via the Android emulator's loopback address (http://10.0.2.2:8000).
- *
- * DROP-IN INSTRUCTIONS:
- * 1. Drop this file into your package integration folder.
- * 2. Invoke `fetchLiveKitToken` inside any CoroutineScope or ViewModel when joining the AI voice portal.
- */
+data class DailyTaskDto(
+    val id: String,
+    val userId: String,
+    val taskDescription: String,
+    val scheduledTime: String,
+    val status: String
+)
+
+data class LiveKitSessionDto(
+    val token: String,
+    val roomName: String,
+    val identity: String,
+    val serverUrl: String
+)
+
 class ApiClient {
 
     companion object {
         private const val TAG = "ApiClient"
-        
-        // Using localhost:8080 with adb reverse for physical device testing
-        private const val BASE_URL = "http://localhost:8080"
+
+        // Android emulator loopback to the host running FastAPI.
+        private const val BASE_URL = "http://10.0.2.2:8080"
     }
 
-    /**
-     * Queries the FastAPI backend gateway to obtain a signed JWT listener token for LiveKit WebRTC.
-     *
-     * @param userId The unique user ID of the device caller.
-     * @return Signed LiveKit connection token (JWT).
-     */
-    suspend fun fetchLiveKitToken(userId: String): String = withContext(Dispatchers.IO) {
-        val endpoint = "$BASE_URL/get-listen-token?user_id=$userId"
-        Log.d(TAG, "Fetching secure JWT listen token from Gateway: $endpoint")
-        
+    suspend fun fetchLiveKitSession(userId: String): LiveKitSessionDto = withContext(Dispatchers.IO) {
+        val endpoint = "$BASE_URL/get-listen-token?user_id=${encode(userId)}"
+        val jsonResponse = requestJson("GET", endpoint)
+        LiveKitSessionDto(
+            token = jsonResponse.getString("token"),
+            roomName = jsonResponse.getString("room_name"),
+            identity = jsonResponse.getString("identity"),
+            serverUrl = jsonResponse.getString("server_url")
+        )
+    }
+
+    suspend fun fetchLiveKitToken(userId: String): String = fetchLiveKitSession(userId).token
+
+    suspend fun fetchDailyTasks(userId: String): List<DailyTaskDto> = withContext(Dispatchers.IO) {
+        val endpoint = "$BASE_URL/tasks?user_id=${encode(userId)}"
+        val jsonResponse = requestJson("GET", endpoint)
+        val tasks = jsonResponse.optJSONArray("tasks") ?: JSONArray()
+        List(tasks.length()) { index -> tasks.getJSONObject(index).toDailyTaskDto() }
+    }
+
+    suspend fun createTask(userId: String, taskDescription: String, scheduledTimeIso: String): DailyTaskDto =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject()
+                .put("user_id", userId)
+                .put("task_description", taskDescription)
+                .put("scheduled_time", scheduledTimeIso)
+            requestJson("POST", "$BASE_URL/tasks", body).getJSONObject("task").toDailyTaskDto()
+        }
+
+    suspend fun updateTaskStatus(userId: String, taskId: String, newStatus: String): DailyTaskDto =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject()
+                .put("user_id", userId)
+                .put("status", newStatus)
+            requestJson("PATCH", "$BASE_URL/tasks/$taskId/status", body).getJSONObject("task").toDailyTaskDto()
+        }
+
+    suspend fun deleteTask(userId: String, taskId: String) = withContext(Dispatchers.IO) {
+        request("DELETE", "$BASE_URL/tasks/$taskId?user_id=${encode(userId)}")
+    }
+
+    private fun requestJson(method: String, endpoint: String, body: JSONObject? = null): JSONObject {
+        val responseText = request(method, endpoint, body)
+        return if (responseText.isBlank()) JSONObject() else JSONObject(responseText)
+    }
+
+    private fun request(method: String, endpoint: String, body: JSONObject? = null): String {
+        Log.d(TAG, "$method $endpoint")
         var connection: HttpURLConnection? = null
         try {
-            val url = URL(endpoint)
-            connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 10000
-            connection.readTimeout = 10000
-            connection.setRequestProperty("Accept", "application/json")
+            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = method
+                connectTimeout = 10000
+                readTimeout = 10000
+                setRequestProperty("Accept", "application/json")
+            }
+
+            if (body != null) {
+                val bytes = body.toString().toByteArray(Charsets.UTF_8)
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.setRequestProperty("Content-Length", bytes.size.toString())
+                connection.outputStream.use { it.write(bytes) }
+            }
 
             val responseCode = connection.responseCode
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
-                val jsonResponse = JSONObject(responseText)
-                val token = jsonResponse.getString("token")
-                
-                Log.d(TAG, "Bearer JWT recovered successfully. Token length: ${token.length}")
-                return@withContext token
-            } else {
-                val errorStream = connection.errorStream
-                val errorMessage = errorStream?.let {
-                    BufferedReader(InputStreamReader(it)).readText()
-                } ?: "Unknown Gateway connection error"
-                
-                Log.e(TAG, "Gateway returned bad status code: $responseCode - $errorMessage")
-                throw Exception("API Gateway Error (Status $responseCode): $errorMessage")
+            if (responseCode in 200..299) {
+                return connection.inputStream?.bufferedReader()?.use { it.readText() }.orEmpty()
             }
+
+            val errorMessage = connection.errorStream?.let {
+                BufferedReader(InputStreamReader(it)).readText()
+            } ?: "Unknown API gateway error"
+            Log.e(TAG, "Gateway returned $responseCode: $errorMessage")
+            throw IllegalStateException("API Gateway Error ($responseCode): $errorMessage")
         } catch (e: Exception) {
-            Log.e(TAG, "Networking connectivity exception of API Gateway: ${e.message}", e)
+            Log.e(TAG, "Gateway request failed: ${e.message}", e)
             throw e
         } finally {
             connection?.disconnect()
         }
     }
+
+    private fun JSONObject.toDailyTaskDto(): DailyTaskDto {
+        return DailyTaskDto(
+            id = getString("id"),
+            userId = getString("user_id"),
+            taskDescription = getString("task_description"),
+            scheduledTime = getString("scheduled_time"),
+            status = getString("status")
+        )
+    }
+
+    private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 }

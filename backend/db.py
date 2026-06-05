@@ -36,6 +36,21 @@ async def insert_task(user_id: str, task_description: str, scheduled_time_iso: s
     return await asyncio.to_thread(_sync_insert_task, user_id, task_description, scheduled_time_iso)
 
 
+def _sync_get_user_tasks(user_id: str) -> list:
+    response = supabase_client.table("daily_tasks") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .order("scheduled_time") \
+        .execute()
+    if hasattr(response, "data"):
+        return response.data
+    return response if isinstance(response, list) else []
+
+
+async def get_user_tasks(user_id: str) -> list:
+    return await asyncio.to_thread(_sync_get_user_tasks, user_id)
+
+
 def _sync_get_pending_tasks(current_time: str) -> list:
     """Synchronously retrieves pending tasks due up to the current_time."""
     response = supabase_client.table("daily_tasks") \
@@ -67,3 +82,44 @@ def _sync_mark_task_completed(task_id: str) -> dict:
 async def mark_task_completed(task_id: str) -> dict:
     """Asynchronously updates a task's status to 'completed'."""
     return await asyncio.to_thread(_sync_mark_task_completed, task_id)
+
+
+def _sync_mark_task_reminded(task_id: str) -> dict:
+    response = supabase_client.table("daily_tasks") \
+        .update({"status": "reminded"}) \
+        .eq("id", task_id) \
+        .execute()
+    if hasattr(response, "data"):
+        return response.data[0] if response.data else {}
+    return response if response else {}
+
+
+async def mark_task_reminded(task_id: str) -> dict:
+    return await asyncio.to_thread(_sync_mark_task_reminded, task_id)
+
+
+def _sync_update_task_status(user_id: str, task_id: str, status: str) -> dict:
+    response = supabase_client.table("daily_tasks") \
+        .update({"status": status}) \
+        .eq("id", task_id) \
+        .eq("user_id", user_id) \
+        .execute()
+    if hasattr(response, "data"):
+        return response.data[0] if response.data else {}
+    return response if response else {}
+
+
+async def update_task_status(user_id: str, task_id: str, status: str) -> dict:
+    return await asyncio.to_thread(_sync_update_task_status, user_id, task_id, status)
+
+
+def _sync_delete_task(user_id: str, task_id: str) -> None:
+    supabase_client.table("daily_tasks") \
+        .delete() \
+        .eq("id", task_id) \
+        .eq("user_id", user_id) \
+        .execute()
+
+
+async def delete_task(user_id: str, task_id: str) -> None:
+    await asyncio.to_thread(_sync_delete_task, user_id, task_id)

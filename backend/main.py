@@ -1,11 +1,14 @@
 import os
 import uuid
+import datetime
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from livekit.api import AccessToken, VideoGrants
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 # Load scheduler startup logic
+import db
 from scheduler import start_scheduler
 
 load_dotenv()
@@ -33,6 +36,17 @@ app.add_middleware(
 )
 
 
+class TaskCreateRequest(BaseModel):
+    user_id: uuid.UUID
+    task_description: str = Field(..., min_length=1, max_length=500)
+    scheduled_time: datetime.datetime
+
+
+class TaskStatusUpdateRequest(BaseModel):
+    user_id: uuid.UUID
+    status: str = Field(..., pattern="^(pending|reminded|completed|skipped)$")
+
+
 @app.on_event("startup")
 def on_startup():
     """Startup hook: triggers scheduler to run task polling loops."""
@@ -47,6 +61,53 @@ def read_root():
         "service": "ChronosAI Backend Gateway",
         "features": ["WebRTC token engine", "Supabase polling synchronization", "Voice Pipeline scheduler"]
     }
+
+
+@app.get("/tasks")
+async def list_tasks(user_id: uuid.UUID = Query(..., description="ChronosAI user UUID.")):
+    try:
+        return {"tasks": await db.get_user_tasks(str(user_id))}
+    except Exception as e:
+        print(f"Error listing tasks for {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to list tasks.")
+
+
+@app.post("/tasks", status_code=201)
+async def create_task(request: TaskCreateRequest):
+    try:
+        task = await db.insert_task(
+            str(request.user_id),
+            request.task_description.strip(),
+            request.scheduled_time.astimezone(datetime.timezone.utc).isoformat()
+        )
+        return {"task": task}
+    except Exception as e:
+        print(f"Error creating task for {request.user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create task.")
+
+
+@app.patch("/tasks/{task_id}/status")
+async def update_task_status(task_id: uuid.UUID, request: TaskStatusUpdateRequest):
+    try:
+        task = await db.update_task_status(str(request.user_id), str(task_id), request.status)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        return {"task": task}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update task.")
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: uuid.UUID, user_id: uuid.UUID = Query(..., description="ChronosAI user UUID.")):
+    try:
+        await db.delete_task(str(user_id), str(task_id))
+        return None
+    except Exception as e:
+        print(f"Error deleting task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete task.")
 
 
 @app.get("/get-listen-token")

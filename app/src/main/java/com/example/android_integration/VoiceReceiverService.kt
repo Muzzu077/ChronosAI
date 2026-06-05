@@ -55,6 +55,7 @@ class VoiceReceiverService : Service() {
         const val ACTION_STOP_CALL = "com.chronosai.ACTION_STOP_CALL"
         const val ACTION_SEND_CHAT = "com.chronosai.ACTION_SEND_CHAT"
         const val EXTRA_JWT_TOKEN = "com.chronosai.EXTRA_JWT_TOKEN"
+        const val EXTRA_SERVER_URL = "com.chronosai.EXTRA_SERVER_URL"
         const val EXTRA_CHAT_MESSAGE = "com.chronosai.EXTRA_CHAT_MESSAGE"
     }
 
@@ -112,8 +113,9 @@ class VoiceReceiverService : Service() {
         when (action) {
             ACTION_START_CALL -> {
                 val token = intent.getStringExtra(EXTRA_JWT_TOKEN)
+                val serverUrl = intent.getStringExtra(EXTRA_SERVER_URL)
                 if (token != null) {
-                    initiateWebRtcRoom(token)
+                    initiateWebRtcRoom(token, serverUrl)
                 } else {
                     Log.e(TAG, "ACTION_START_CALL failed: Transmitted target token is null.")
                 }
@@ -135,7 +137,7 @@ class VoiceReceiverService : Service() {
     /**
      * Set up LiveKit Room and start connection loop.
      */
-    private fun initiateWebRtcRoom(jwtToken: String) {
+    private fun initiateWebRtcRoom(jwtToken: String, gatewayServerUrl: String?) {
         if (isConnected) {
             Log.w(TAG, "Initiation ignored: Room already connected.")
             return
@@ -160,7 +162,7 @@ class VoiceReceiverService : Service() {
                 configureAudioRouting()
 
                 // 3. Connect to the room using the fetched token
-                val serverUrl = "wss://voice-call-aelv823z.livekit.cloud"
+                val serverUrl = gatewayServerUrl ?: "wss://voice-call-aelv823z.livekit.cloud"
                 Log.d(TAG, "Connecting to: $serverUrl")
                 
                 liveKitRoom?.connect(

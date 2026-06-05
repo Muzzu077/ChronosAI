@@ -78,9 +78,8 @@ async def poll_scheduled_tasks():
                 print(f"Scheduler: LiveKitAPI room connection error for {room_name}: {str(e)}")
                 # Continue processing other tasks anyway
                 
-            # Update database state to completed
-            await db.mark_task_completed(task_id)
-            print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'completed' in Supabase.")
+            await db.mark_task_reminded(task_id)
+            print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in Supabase.")
             
     except Exception as e:
         print(f"Scheduler error in poll cycle: {str(e)}")
