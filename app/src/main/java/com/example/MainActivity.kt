@@ -1,6 +1,14 @@
 package com.example
 
+import android.content.Intent
 import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import java.util.Locale
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -50,15 +58,15 @@ import java.util.UUID
 // 1. DATA ENTRIES & MODEL CONVENTIONS
 // =========================================================================
 
-enum class SatoriTaskStatus { PENDING, UPCOMING, COMPLETED }
+enum class ChronosTaskStatus { PENDING, UPCOMING, COMPLETED }
 
-data class SatoriTask(
+data class ChronosTask(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val time: String,
     val description: String = "",
     val isPm: Boolean,
-    val status: SatoriTaskStatus,
+    val status: ChronosTaskStatus,
     val colorBarHex: Long
 )
 
@@ -68,8 +76,149 @@ enum class VoiceSessionState { IDLE, CONNECTING, LISTENING }
 // 2. STATE MANAGER (VIEWMODEL)
 // =========================================================================
 
-class SatoriViewModel : ViewModel() {
+class ChronosViewModel : ViewModel() {
     private val apiClient = ApiClient()
+
+    private val triggeredTaskIds = mutableSetOf<String>()
+    private val _pendingReminder = MutableStateFlow<Pair<String, String>?>(null)
+    val pendingReminder = _pendingReminder.asStateFlow()
+
+    fun clearPendingReminder() {
+        _pendingReminder.value = null
+    }
+
+    private fun startLocalReminderChecker() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            while (true) {
+                delay(5000)
+                try {
+                    checkPendingReminders()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    private fun checkPendingReminders() {
+        val currentTasks = _tasks.value
+        val now = java.util.Calendar.getInstance()
+        val currentHour = now.get(java.util.Calendar.HOUR_OF_DAY)
+        val currentMin = now.get(java.util.Calendar.MINUTE)
+        
+        for (task in currentTasks) {
+            if (task.status == ChronosTaskStatus.PENDING && !triggeredTaskIds.contains(task.id)) {
+                val timeParts = task.time.split(":")
+                if (timeParts.size == 2) {
+                    var taskHour = timeParts[0].toIntOrNull() ?: 0
+                    val taskMin = timeParts[1].toIntOrNull() ?: 0
+                    if (task.isPm && taskHour < 12) taskHour += 12
+                    if (!task.isPm && taskHour == 12) taskHour = 0
+                    
+                    val taskTotalMinutes = taskHour * 60 + taskMin
+                    val currentTotalMinutes = currentHour * 60 + currentMin
+                    
+                    if (taskTotalMinutes <= currentTotalMinutes && (currentTotalMinutes - taskTotalMinutes) < 2) {
+                        triggeredTaskIds.add(task.id)
+                        _pendingReminder.value = Pair(task.title, task.id)
+                    }
+                }
+            }
+        }
+    }
+
+    init {
+        com.example.android_integration.VoiceReceiverService.activeViewModel = this
+        startLocalReminderChecker()
+        
+        viewModelScope.launch {
+            while (true) {
+                delay(15000)
+                try {
+                    if (_userId.value.isNotEmpty()) {
+                        fetchTasksFromBackend()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        com.example.android_integration.VoiceReceiverService.activeViewModel = null
+        ringtone?.stop()
+    }
+
+    // Callbacks for Speech/TTS bound to MainActivity
+    var onSpeakRequested: ((String, Boolean) -> Unit)? = null
+    var onListenRequested: (() -> Unit)? = null
+
+    private val _showIncomingCall = MutableStateFlow(false)
+    val showIncomingCall = _showIncomingCall.asStateFlow()
+
+    private val _showActiveCall = MutableStateFlow(false)
+    val showActiveCall = _showActiveCall.asStateFlow()
+
+    private val _activeCallText = MutableStateFlow("")
+    val activeCallText = _activeCallText.asStateFlow()
+
+    private val _activeCallTaskId = MutableStateFlow("")
+    val activeCallTaskId = _activeCallTaskId.asStateFlow()
+    
+    private var ringtone: android.media.Ringtone? = null
+
+    fun triggerIncomingCall(context: android.content.Context, text: String, taskId: String) {
+        _liveTranscript.value = ""
+        _activeCallText.value = text
+        _activeCallTaskId.value = taskId
+        _showIncomingCall.value = true
+        _showActiveCall.value = false
+        
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+            try {
+                if (ringtone == null) {
+                    val ringtoneUri = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_RINGTONE)
+                    ringtone = android.media.RingtoneManager.getRingtone(context, ringtoneUri)
+                }
+                ringtone?.play()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun acceptCall(context: android.content.Context) {
+        ringtone?.stop()
+        _showIncomingCall.value = false
+        _showActiveCall.value = true
+        
+        // Start LiveKit session
+        startVoiceSession(context)
+    }
+
+    fun declineCall() {
+        ringtone?.stop()
+        _showIncomingCall.value = false
+        _showActiveCall.value = false
+        _activeCallText.value = ""
+        _activeCallTaskId.value = ""
+    }
+    
+    fun hangUpCall(context: android.content.Context) {
+        ringtone?.stop()
+        _showIncomingCall.value = false
+        _showActiveCall.value = false
+        _activeCallText.value = ""
+        _activeCallTaskId.value = ""
+        endVoiceSession(context)
+    }
+
+    fun speakActiveCallText(text: String) {
+        val shouldListen = _showActiveCall.value
+        onSpeakRequested?.invoke(text, shouldListen)
+    }
 
     private val _currentTab = MutableStateFlow(0) 
     val currentTab = _currentTab.asStateFlow()
@@ -77,7 +226,7 @@ class SatoriViewModel : ViewModel() {
     private val _isNewTaskSheetOpen = MutableStateFlow(false)
     val isNewTaskSheetOpen = _isNewTaskSheetOpen.asStateFlow()
 
-    private val _tasks = MutableStateFlow<List<SatoriTask>>(emptyList())
+    private val _tasks = MutableStateFlow<List<ChronosTask>>(emptyList())
     val tasks = _tasks.asStateFlow()
 
     private val _voiceSessionState = MutableStateFlow(VoiceSessionState.IDLE)
@@ -89,33 +238,116 @@ class SatoriViewModel : ViewModel() {
     private val _userName = MutableStateFlow("")
     val userName = _userName.asStateFlow()
 
+    private val _isProfileLoaded = MutableStateFlow(false)
+    val isProfileLoaded = _isProfileLoaded.asStateFlow()
+
+    private val _userRole = MutableStateFlow("Student")
+    val userRole = _userRole.asStateFlow()
+
+    private val _userGoal = MutableStateFlow("Cybersecurity")
+    val userGoal = _userGoal.asStateFlow()
+
+    private val _userTimezone = MutableStateFlow("Asia/Kolkata")
+    val userTimezone = _userTimezone.asStateFlow()
+
+    private val _showSettingsDialog = MutableStateFlow(false)
+    val showSettingsDialog = _showSettingsDialog.asStateFlow()
+
+    private val _showEditProfileDialog = MutableStateFlow(false)
+    val showEditProfileDialog = _showEditProfileDialog.asStateFlow()
+
     private val _userId = MutableStateFlow("")
+
+    fun setVoiceSessionState(state: VoiceSessionState) {
+        _voiceSessionState.value = state
+    }
+
+    fun setShowSettingsDialog(show: Boolean) {
+        _showSettingsDialog.value = show
+    }
+
+    fun setShowEditProfileDialog(show: Boolean) {
+        _showEditProfileDialog.value = show
+    }
 
     fun loadUserName(context: android.content.Context) {
         val prefs = context.getSharedPreferences("ChronosPrefs", android.content.Context.MODE_PRIVATE)
-        _userName.value = prefs.getString("user_name", "") ?: ""
-        _userId.value = getOrCreateUserId(context)
+        val name = prefs.getString("user_name", "") ?: ""
+        val role = prefs.getString("user_role", "Student") ?: "Student"
+        val goal = prefs.getString("user_goal", "Cybersecurity") ?: "Cybersecurity"
+        val tz = prefs.getString("user_timezone", "Asia/Kolkata") ?: "Asia/Kolkata"
+        _userName.value = name
+        _userRole.value = role
+        _userGoal.value = goal
+        _userTimezone.value = tz
+        val uid = getOrCreateUserId(context)
+        _userId.value = uid
+        _isProfileLoaded.value = true
         fetchTasksFromBackend()
+
+        if (name.isNotEmpty()) {
+            viewModelScope.launch {
+                try {
+                    apiClient.updateProfile(uid, name, role, goal, tz)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
     }
 
     fun saveOnboarding(context: android.content.Context, name: String, role: String, goal: String) {
         val prefs = context.getSharedPreferences("ChronosPrefs", android.content.Context.MODE_PRIVATE)
-        _userId.value = getOrCreateUserId(context)
+        val uid = getOrCreateUserId(context)
+        _userId.value = uid
         prefs.edit().apply {
             putString("user_name", name)
             putString("user_role", role)
             putString("user_goal", goal)
+            putString("user_timezone", "Asia/Kolkata")
         }.apply()
         _userName.value = name
+        _userRole.value = role
+        _userGoal.value = goal
+        _userTimezone.value = "Asia/Kolkata"
         suggestInitialTasks(role, goal)
+
+        viewModelScope.launch {
+            try {
+                apiClient.updateProfile(uid, name, role, goal, "Asia/Kolkata")
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                _isProfileLoaded.value = true
+            }
+        }
+    }
+
+    fun updateProfileSettings(context: android.content.Context, name: String, role: String, goal: String, timezone: String) {
+        val prefs = context.getSharedPreferences("ChronosPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            putString("user_name", name)
+            putString("user_role", role)
+            putString("user_goal", goal)
+            putString("user_timezone", timezone)
+        }.apply()
+        _userName.value = name
+        _userRole.value = role
+        _userGoal.value = goal
+        _userTimezone.value = timezone
+
+        val uid = _userId.value
+        viewModelScope.launch {
+            try {
+                apiClient.updateProfile(uid, name, role, goal, timezone)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     private fun getOrCreateUserId(context: android.content.Context): String {
-        val prefs = context.getSharedPreferences("ChronosPrefs", android.content.Context.MODE_PRIVATE)
-        prefs.getString("chronos_user_id", null)?.let { return it }
-        val newUserId = UUID.randomUUID().toString()
-        prefs.edit().putString("chronos_user_id", newUserId).apply()
-        return newUserId
+        return "293dafd6-72d4-4dc9-a668-4ba8f8586ca7"
     }
 
     private fun suggestInitialTasks(role: String, goal: String) {
@@ -156,13 +388,13 @@ class SatoriViewModel : ViewModel() {
 
     fun addTask(title: String, time: String, isPm: Boolean, description: String = "") {
         val taskId = UUID.randomUUID().toString()
-        val newTask = SatoriTask(
+        val newTask = ChronosTask(
             id = taskId,
             title = title,
             time = time,
             isPm = isPm,
             description = description,
-            status = SatoriTaskStatus.PENDING,
+            status = ChronosTaskStatus.PENDING,
             colorBarHex = 0xFF4285F4
         )
         _tasks.value = _tasks.value + newTask
@@ -185,7 +417,7 @@ class SatoriViewModel : ViewModel() {
                 
                 val savedTask = apiClient.createTask(userId, title, isoTime)
                 _tasks.value = _tasks.value.map {
-                    if (it.id == taskId) savedTask.toSatoriTask(description) else it
+                    if (it.id == taskId) savedTask.toChronosTask(description) else it
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -210,10 +442,10 @@ class SatoriViewModel : ViewModel() {
         _tasks.value = _tasks.value.map {
             if (it.id == taskId) {
                 val nextStatus = when (it.status) {
-                    SatoriTaskStatus.PENDING, SatoriTaskStatus.UPCOMING -> SatoriTaskStatus.COMPLETED
-                    SatoriTaskStatus.COMPLETED -> SatoriTaskStatus.PENDING
+                    ChronosTaskStatus.PENDING, ChronosTaskStatus.UPCOMING -> ChronosTaskStatus.COMPLETED
+                    ChronosTaskStatus.COMPLETED -> ChronosTaskStatus.PENDING
                 }
-                newStatusStr = if (nextStatus == SatoriTaskStatus.COMPLETED) "completed" else "pending"
+                newStatusStr = if (nextStatus == ChronosTaskStatus.COMPLETED) "completed" else "pending"
                 it.copy(status = nextStatus)
             } else it
         }
@@ -233,11 +465,18 @@ class SatoriViewModel : ViewModel() {
         viewModelScope.launch {
             try {
                 val userId = _userId.value.ifBlank { return@launch }
-                _tasks.value = apiClient.fetchDailyTasks(userId).map { it.toSatoriTask() }
+                _tasks.value = apiClient.fetchDailyTasks(userId).map { it.toChronosTask() }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
+    }
+
+    fun startTestVoiceCall(context: android.content.Context) {
+        _activeCallText.value = "TEST_CALL"
+        _activeCallTaskId.value = "TEST_CALL_ID"
+        _showActiveCall.value = true
+        startVoiceSession(context)
     }
 
     fun startVoiceSession(context: android.content.Context) {
@@ -299,26 +538,57 @@ class SatoriViewModel : ViewModel() {
     }
 
     fun updateTranscript(text: String) {
-        _liveTranscript.value = text
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        val prefix = if (trimmed.startsWith("You:") || trimmed.startsWith("ChronosAI:")) "" else "ChronosAI: "
+        if (_liveTranscript.value.isEmpty()) {
+            _liveTranscript.value = "$prefix$trimmed"
+        } else {
+            _liveTranscript.value = _liveTranscript.value + "\n$prefix$trimmed"
+        }
     }
 
-    private fun DailyTaskDto.toSatoriTask(description: String = ""): SatoriTask {
-        val timePart = scheduledTime.substringAfter("T", "00:00").take(5)
-        val hour = timePart.substringBefore(":").toIntOrNull() ?: 0
-        val minute = timePart.substringAfter(":", "00").take(2)
-        val isPm = hour >= 12
+    private fun DailyTaskDto.toChronosTask(description: String = ""): ChronosTask {
+        var hour = 0
+        var minute = "00"
+        var isPm = false
+        try {
+            // Parse robustly using java.time OffsetDateTime (e.g. 2026-06-05T18:32:00+00:00)
+            val odt = java.time.OffsetDateTime.parse(scheduledTime)
+            val localTime = odt.atZoneSameInstant(java.time.ZoneId.systemDefault())
+            hour = localTime.hour
+            minute = "%02d".format(localTime.minute)
+            isPm = hour >= 12
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                // Fallback to Instant parsing (e.g. 2026-06-05T18:32:00Z)
+                val instant = java.time.Instant.parse(scheduledTime)
+                val localTime = instant.atZone(java.time.ZoneId.systemDefault())
+                hour = localTime.hour
+                minute = "%02d".format(localTime.minute)
+                isPm = hour >= 12
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+                val timePart = scheduledTime.substringAfter("T", "00:00").take(5)
+                hour = timePart.substringBefore(":").toIntOrNull() ?: 0
+                minute = timePart.substringAfter(":", "00").take(2)
+                isPm = hour >= 12
+            }
+        }
+
         val hour12 = when {
             hour == 0 -> 12
             hour > 12 -> hour - 12
             else -> hour
         }
-        return SatoriTask(
+        return ChronosTask(
             id = id,
             title = taskDescription,
             time = "%02d:%s".format(hour12, minute),
             description = description,
             isPm = isPm,
-            status = if (status == "completed") SatoriTaskStatus.COMPLETED else SatoriTaskStatus.PENDING,
+            status = if (status == "completed") ChronosTaskStatus.COMPLETED else ChronosTaskStatus.PENDING,
             colorBarHex = 0xFF4285F4
         )
     }
@@ -389,28 +659,41 @@ fun ChronosAITheme(content: @Composable () -> Unit) {
 // =========================================================================
 
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        val model = androidx.lifecycle.ViewModelProvider(this)[ChronosViewModel::class.java]
+        model.loadUserName(applicationContext)
+        
         enableEdgeToEdge()
         setContent {
             ChronosAITheme {
-                MainAppContainer()
+                MainAppContainer(model)
             }
         }
     }
 }
 
 @Composable
-fun MainAppContainer() {
-    val model: SatoriViewModel = viewModel()
+fun MainAppContainer(model: ChronosViewModel) {
     val currentTab by model.currentTab.collectAsState()
     val isNewTaskOpen by model.isNewTaskSheetOpen.collectAsState()
     val voiceState by model.voiceSessionState.collectAsState()
     val userName by model.userName.collectAsState()
+    val isProfileLoaded by model.isProfileLoaded.collectAsState()
     val context = LocalContext.current
 
-    LaunchedEffect(Unit) {
-        model.loadUserName(context)
+    if (!isProfileLoaded) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+        }
+        return
     }
 
     if (userName.isEmpty()) {
@@ -418,57 +701,116 @@ fun MainAppContainer() {
         return
     }
 
-	    Scaffold(
-	        modifier = Modifier.fillMaxSize(),
-        bottomBar = {
-            ChronosBottomBar(
-                selectedIndex = currentTab,
-                onTabSelected = { index -> model.setTab(index) }
-            )
-        },
-	        floatingActionButton = {
-	            if (currentTab == 0) {
-	                FloatingActionButton(
-	                    onClick = { model.setNewTaskSheetOpen(true) },
-	                    containerColor = MaterialTheme.colorScheme.primary,
-	                    contentColor = MaterialTheme.colorScheme.onPrimary,
-	                    shape = CircleShape
-	                ) {
-	                    Icon(Icons.Default.Add, contentDescription = "Add task", modifier = Modifier.size(34.dp))
-	                }
-	            }
-	        },
-        containerColor = MaterialTheme.colorScheme.background
-    ) { innerPadding ->
-        Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
-            AnimatedContent(
-                targetState = currentTab,
-                transitionSpec = { fadeIn() togetherWith fadeOut() },
-                label = "nav"
-            ) { targetTab ->
-                when (targetTab) {
-                    0 -> ScheduleScreen(model, context)
-                    1 -> AIAssistantScreen(model, context)
-                    2 -> FocusTimerScreen()
-                    3 -> ProfileScreen(userName)
+    val pendingReminder by model.pendingReminder.collectAsState()
+    LaunchedEffect(pendingReminder) {
+        val reminder = pendingReminder
+        if (reminder != null) {
+            model.triggerIncomingCall(context, reminder.first, reminder.second)
+            model.clearPendingReminder()
+        }
+    }
+
+    val showIncomingCall by model.showIncomingCall.collectAsState()
+    val showActiveCall by model.showActiveCall.collectAsState()
+    val activeCallText by model.activeCallText.collectAsState()
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            modifier = Modifier.fillMaxSize(),
+            bottomBar = {
+                ChronosBottomBar(
+                    selectedIndex = currentTab,
+                    onTabSelected = { index -> model.setTab(index) }
+                )
+            },
+            floatingActionButton = {
+                if (currentTab == 0) {
+                    FloatingActionButton(
+                        onClick = { model.setNewTaskSheetOpen(true) },
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        shape = CircleShape
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = "Add task", modifier = Modifier.size(34.dp))
+                    }
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.background
+        ) { innerPadding ->
+            Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+                AnimatedContent(
+                    targetState = currentTab,
+                    transitionSpec = { fadeIn() togetherWith fadeOut() },
+                    label = "nav"
+                ) { targetTab ->
+                    when (targetTab) {
+                        0 -> ScheduleScreen(model, context)
+                        1 -> AIAssistantScreen(model, context)
+                        2 -> FocusTimerScreen(model)
+                        3 -> ProfileScreen(model)
+                    }
+                }
+
+                val showSettings by model.showSettingsDialog.collectAsState()
+                val showEditProfile by model.showEditProfileDialog.collectAsState()
+                val userRole by model.userRole.collectAsState()
+                val userGoal by model.userGoal.collectAsState()
+                val userTimezone by model.userTimezone.collectAsState()
+
+                if (showSettings) {
+                    SettingsDialog(
+                        onDismiss = { model.setShowSettingsDialog(false) },
+                        context = context,
+                        model = model
+                    )
+                }
+
+                if (showEditProfile) {
+                    EditProfileDialog(
+                        currentName = userName,
+                        currentRole = userRole,
+                        currentGoal = userGoal,
+                        currentTimezone = userTimezone,
+                        onDismiss = { model.setShowEditProfileDialog(false) },
+                        onConfirm = { name, role, goal, timezone ->
+                            model.updateProfileSettings(context, name, role, goal, timezone)
+                            model.setShowEditProfileDialog(false)
+                        }
+                    )
+                }
+
+                if (isNewTaskOpen) {
+                    NewTaskDialog(
+                        onDismiss = { model.setNewTaskSheetOpen(false) },
+                        onConfirm = { name, time, isPm, desc ->
+                            model.addTask(name, time, isPm, desc)
+                            model.setNewTaskSheetOpen(false)
+                        }
+                    )
                 }
             }
-
-            if (isNewTaskOpen) {
-                NewTaskDialog(
-                    onDismiss = { model.setNewTaskSheetOpen(false) },
-                    onConfirm = { name, time, isPm, desc ->
-                        model.addTask(name, time, isPm, desc)
-                        model.setNewTaskSheetOpen(false)
-                    }
-                )
-            }
         }
-	}
+
+        if (showIncomingCall) {
+            IncomingCallOverlay(
+                text = activeCallText,
+                onAccept = { model.acceptCall(context) },
+                onDecline = { model.declineCall() }
+            )
+        }
+
+        if (showActiveCall) {
+            ActiveCallOverlay(
+                model = model,
+                context = context,
+                onHangUp = { model.hangUpCall(context) }
+            )
+        }
+    }
 }
 
 @Composable
-fun ChronosTopBar(userName: String, aiActive: Boolean = false) {
+fun ChronosTopBar(userName: String, aiActive: Boolean = false, onSettingsClick: (() -> Unit)? = null) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -488,15 +830,16 @@ fun ChronosTopBar(userName: String, aiActive: Boolean = false) {
                 .border(2.dp, Color(0xFFF0D7C5), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            Text(
-                userName.take(1).ifBlank { "C" }.uppercase(),
-                color = Color.White,
-                fontWeight = FontWeight.Black
+            Icon(
+                imageVector = Icons.Default.DateRange,
+                contentDescription = "Chronos AI Logo",
+                tint = Color.White,
+                modifier = Modifier.size(24.dp)
             )
         }
         Spacer(modifier = Modifier.width(16.dp))
         Text(
-            "Satori AI",
+            "Chronos AI",
             style = MaterialTheme.typography.headlineSmall,
             color = MaterialTheme.colorScheme.primary,
             fontWeight = FontWeight.Bold,
@@ -519,7 +862,16 @@ fun ChronosTopBar(userName: String, aiActive: Boolean = false) {
             }
             Spacer(modifier = Modifier.width(14.dp))
         }
-        Icon(Icons.Default.Settings, contentDescription = "Settings", tint = ChronosMuted, modifier = Modifier.size(34.dp))
+        if (onSettingsClick != null) {
+            IconButton(onClick = onSettingsClick) {
+                Icon(
+                    Icons.Default.Settings,
+                    contentDescription = "Settings",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+        }
     }
 }
 
@@ -568,11 +920,11 @@ fun ChronosBottomBar(selectedIndex: Int, onTabSelected: (Int) -> Unit) {
 // =========================================================================
 
 @Composable
-fun ScheduleScreen(model: SatoriViewModel, context: android.content.Context) {
+fun ScheduleScreen(model: ChronosViewModel, context: android.content.Context) {
     val tasks by model.tasks.collectAsState()
     val userName by model.userName.collectAsState()
-    val activeCount = tasks.count { it.status != SatoriTaskStatus.COMPLETED }
-    val completedCount = tasks.count { it.status == SatoriTaskStatus.COMPLETED }
+    val activeCount = tasks.count { it.status != ChronosTaskStatus.COMPLETED }
+    val completedCount = tasks.count { it.status == ChronosTaskStatus.COMPLETED }
     val goalProgress = if (tasks.isEmpty()) 0f else completedCount.toFloat() / tasks.size
 
     Column(
@@ -580,7 +932,7 @@ fun ScheduleScreen(model: SatoriViewModel, context: android.content.Context) {
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        ChronosTopBar(userName, aiActive = true)
+        ChronosTopBar(userName, aiActive = true, onSettingsClick = { model.setShowSettingsDialog(true) })
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
@@ -667,13 +1019,47 @@ fun ScheduleScreen(model: SatoriViewModel, context: android.content.Context) {
                     }
                 }
             }
+            item {
+                Card(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F0FE)),
+                    border = BorderStroke(1.dp, Color(0xFFADCCF8)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(24.dp)) {
+                        Text("MOCK VOICE TEST", color = Color(0xFF1A73E8), fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Creates a 'Test Reminder' scheduled for 2 minutes from now, automatically starts Nova Voice, and verifies the end-to-end voice loop.", fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(18.dp))
+                        Button(
+                            onClick = {
+                                val cal = java.util.Calendar.getInstance()
+                                cal.add(java.util.Calendar.MINUTE, 2)
+                                val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
+                                val min = cal.get(java.util.Calendar.MINUTE)
+                                val isPm = hour >= 12
+                                val hour12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour
+                                val timeStr = "%02d:%02d".format(hour12, min)
+                                
+                                model.addTask("Test Reminder", timeStr, isPm, "This is a test reminder.")
+                                model.startVoiceSession(context)
+                            },
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier.fillMaxWidth().height(50.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A73E8))
+                        ) {
+                            Text("START TEST", fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-fun TaskRowItem(task: SatoriTask, onCheckedChange: () -> Unit, onDelete: () -> Unit) {
-    val completed = task.status == SatoriTaskStatus.COMPLETED
+fun TaskRowItem(task: ChronosTask, onCheckedChange: () -> Unit, onDelete: () -> Unit) {
+    val completed = task.status == ChronosTaskStatus.COMPLETED
     val accent = when {
         completed -> Color(0xFFA9A39C)
         task.isPm -> Color(0xFFE98A45)
@@ -739,165 +1125,362 @@ fun TaskRowItem(task: SatoriTask, onCheckedChange: () -> Unit, onDelete: () -> U
 // =========================================================================
 
 @Composable
-fun AIAssistantScreen(model: SatoriViewModel, context: android.content.Context) {
+fun AIAssistantScreen(model: ChronosViewModel, context: android.content.Context) {
     val voiceState by model.voiceSessionState.collectAsState()
     val transcript by model.liveTranscript.collectAsState()
     var chatMessage by remember { mutableStateOf("") }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    // Keep scroll position at the bottom of the transcript during call
+    LaunchedEffect(transcript) {
+        if (transcript.isNotEmpty()) {
+            val lines = transcript.split("\n").filter { it.isNotBlank() }
+            if (lines.isNotEmpty()) {
+                try {
+                    listState.animateScrollToItem(lines.size - 1)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        ChronosTopBar("Nova", aiActive = voiceState != VoiceSessionState.IDLE)
+        ChronosTopBar("Chronos Assistant", aiActive = voiceState != VoiceSessionState.IDLE, onSettingsClick = { model.setShowSettingsDialog(true) })
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
-        when (voiceState) {
-            VoiceSessionState.IDLE, VoiceSessionState.CONNECTING -> {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
-                    contentPadding = PaddingValues(top = 72.dp, bottom = 120.dp)
+
+        // Header Status Card
+        Card(
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = ChronosPanel),
+            border = BorderStroke(1.dp, ChronosLine),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Glowing orb indicator
+                val orbColor = when (voiceState) {
+                    VoiceSessionState.IDLE -> Color(0xFF4CAF50) // Steady green
+                    VoiceSessionState.CONNECTING -> Color(0xFFFF9800) // Pulsing orange
+                    VoiceSessionState.LISTENING -> Color(0xFFC9672A) // Pulsing rust
+                }
+                
+                val infiniteTransition = rememberInfiniteTransition(label = "orbPulse")
+                val scale by infiniteTransition.animateFloat(
+                    initialValue = 0.8f,
+                    targetValue = 1.2f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 1000, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse
+                    ),
+                    label = "orbPulseScale"
+                )
+                
+                Box(
+                    modifier = Modifier
+                        .size(14.dp)
+                        .graphicsLayer {
+                            if (voiceState != VoiceSessionState.IDLE) {
+                                scaleX = scale
+                                scaleY = scale
+                            }
+                        }
+                        .clip(CircleShape)
+                        .background(orbColor)
+                        .border(2.dp, Color.White, CircleShape)
+                )
+                
+                Spacer(modifier = Modifier.width(12.dp))
+                
+                Column(modifier = Modifier.weight(1f)) {
+                    val statusText = when (voiceState) {
+                        VoiceSessionState.IDLE -> "Chronos Engine Ready"
+                        VoiceSessionState.CONNECTING -> "Establishing Secure Link..."
+                        VoiceSessionState.LISTENING -> "Neural Link Active"
+                    }
+                    val subText = when (voiceState) {
+                        VoiceSessionState.IDLE -> "Press mic or type to begin planning"
+                        VoiceSessionState.CONNECTING -> "Synchronizing state vectors..."
+                        VoiceSessionState.LISTENING -> "Voice and text sync active"
+                    }
+                    Text(
+                        text = statusText,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        color = ChronosInk,
+                        fontFamily = ChronosSerif
+                    )
+                    Text(
+                        text = subText,
+                        fontSize = 12.sp,
+                        color = ChronosMuted,
+                        fontFamily = ChronosSans
+                    )
+                }
+                
+                // Voice Mode Button
+                IconButton(
+                    onClick = {
+                        if (voiceState == VoiceSessionState.IDLE) {
+                            model.startVoiceSession(context)
+                        } else {
+                            model.endVoiceSession(context)
+                        }
+                    },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(if (voiceState != VoiceSessionState.IDLE) Color(0xFFD43A2F) else MaterialTheme.colorScheme.primary)
                 ) {
-                    item {
-                        Card(
-                            shape = RoundedCornerShape(32.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F0E8)),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(32.dp), verticalArrangement = Arrangement.spacedBy(26.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text("Nova Voice", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Normal)
-                                        Text("Intelligent task synthesis", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp)
-                                    }
-                                    Surface(
-                                        shape = RoundedCornerShape(28.dp),
-                                        color = Color(0xFFFFEFE6),
-                                        border = BorderStroke(1.dp, Color(0xFFEFC9AF))
-                                    ) {
-                                        Text(
-                                            if (voiceState == VoiceSessionState.CONNECTING) "SYNCING" else "LISTEN",
-                                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
-                                            color = MaterialTheme.colorScheme.primary,
-                                            fontWeight = FontWeight.Black,
-                                            letterSpacing = 2.sp
-                                        )
-                                    }
-                                }
-                                Text("TASK DESCRIPTION", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
-                                OutlinedTextField(
-                                    value = chatMessage,
-                                    onValueChange = { chatMessage = it },
-                                    placeholder = { Text("Plan my DSA practice and assignment tonight...") },
-                                    minLines = 4,
-                                    shape = RoundedCornerShape(22.dp),
-                                    modifier = Modifier.fillMaxWidth(),
-                                    trailingIcon = { Icon(Icons.Default.Call, contentDescription = null, tint = Color(0xFFE2A57E)) }
+                    Icon(
+                        imageVector = if (voiceState != VoiceSessionState.IDLE) Icons.Default.Close else Icons.Default.Mic,
+                        contentDescription = "Toggle Call",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+
+        // Main Conversation Area
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            if (transcript.isBlank()) {
+                // Welcome and suggestions screen
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 24.dp, vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(76.dp)
+                            .clip(CircleShape)
+                            .background(
+                                Brush.radialGradient(
+                                    listOf(Color(0xFFE5925E), Color(0xFFC9672A), Color(0xFF9D3E3E))
                                 )
-                                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    AssistChip(
-                                        onClick = {},
-                                        label = { Text("Today") },
-                                        leadingIcon = { Icon(Icons.Default.DateRange, contentDescription = null) },
-                                        shape = RoundedCornerShape(16.dp),
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    AssistChip(
-                                        onClick = {},
-                                        label = { Text("14:30 PM") },
-                                        leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                                        shape = RoundedCornerShape(16.dp),
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                                Surface(
-                                    shape = RoundedCornerShape(22.dp),
-                                    color = Color(0xFFF3ECE3),
-                                    border = BorderStroke(1.dp, Color(0xFFE9DED2)),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Row(modifier = Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        Box(modifier = Modifier.size(58.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xFFEFDCCB)), contentAlignment = Alignment.Center) {
-                                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(30.dp))
+                            )
+                            .border(2.dp, Color(0xFFFFF6EE), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Face,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(40.dp)
+                        )
+                    }
+                    Text(
+                        "I am ChronosAI",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Black,
+                        color = ChronosInk,
+                        fontFamily = ChronosSerif
+                    )
+                    Text(
+                        "Your Chief of Staff. I schedule your tasks, track daily accountability, and keep your life in balance.",
+                        textAlign = TextAlign.Center,
+                        fontSize = 14.sp,
+                        color = ChronosMuted,
+                        fontFamily = ChronosSans,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Text(
+                        "SUGGESTED ACTIONS",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 11.sp,
+                        letterSpacing = 1.5.sp,
+                        fontFamily = ChronosSans
+                    )
+                    
+                    // 2x2 beautiful cards for suggestions
+                    val suggestions = listOf(
+                        Pair("Plan Study", "Make a detailed schedule for my exam study starting at 8 PM."),
+                        Pair("Analytics", "How was my productivity and completion rate this week?"),
+                        Pair("Prayer Block", "Fetch today's prayer times and block them in my schedule."),
+                        Pair("Reschedule", "I got busy. Can you reschedule my incomplete tasks to tomorrow?")
+                    )
+                    
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        suggestions.chunked(2).forEach { rowList ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                rowList.forEach { (label, text) ->
+                                    Card(
+                                        onClick = { chatMessage = text },
+                                        shape = RoundedCornerShape(18.dp),
+                                        colors = CardDefaults.cardColors(containerColor = ChronosPanel),
+                                        border = BorderStroke(1.dp, ChronosLine),
+                                        modifier = Modifier.weight(1f).height(85.dp)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = label,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 13.sp,
+                                                color = ChronosInk,
+                                                maxLines = 1
+                                            )
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text("Try prompt", color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(12.dp))
+                                            }
                                         }
-                                        Spacer(modifier = Modifier.width(18.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text("Proactive Reminders", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                                            Text("AI-guided focus nudges", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                        Switch(checked = true, onCheckedChange = {}, colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary))
                                     }
-                                }
-                                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    OutlinedButton(
-                                        onClick = { chatMessage = "" },
-                                        shape = RoundedCornerShape(18.dp),
-                                        modifier = Modifier.weight(1f).height(64.dp)
-                                    ) { Text("Discard", fontSize = 18.sp) }
-                                    Button(
-                                        onClick = {
-                                            if (chatMessage.isNotBlank()) model.sendChatMessage(context, chatMessage)
-                                            model.startVoiceSession(context)
-                                        },
-                                        shape = RoundedCornerShape(18.dp),
-                                        modifier = Modifier.weight(1.45f).height(64.dp)
-                                    ) { Text("Schedule Task", fontSize = 18.sp, fontWeight = FontWeight.Black) }
                                 }
                             }
                         }
                     }
                 }
+            } else {
+                // Transcript message list
+                val lines = transcript.split("\n").filter { it.isNotBlank() }
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp)
+                ) {
+                    items(lines) { line ->
+                        val isMe = line.startsWith("You:")
+                        val bubbleBg = if (isMe) Color(0xFFC9672A) else ChronosPanel
+                        val align = if (isMe) Alignment.End else Alignment.Start
+                        val textColor = if (isMe) Color.White else ChronosInk
+                        val borderStroke = if (isMe) null else BorderStroke(1.dp, ChronosLine)
+                        val bubbleShape = if (isMe) {
+                            RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 2.dp)
+                        } else {
+                            RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 2.dp, bottomEnd = 20.dp)
+                        }
+
+                        Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
+                            Surface(
+                                shape = bubbleShape,
+                                color = bubbleBg,
+                                border = borderStroke,
+                                modifier = Modifier.widthIn(max = 280.dp)
+                            ) {
+                                Text(
+                                    text = line.substringAfter(":").trim(),
+                                    color = textColor,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp),
+                                    fontSize = 15.sp,
+                                    fontFamily = ChronosSans
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = if (isMe) "You" else "ChronosAI",
+                                color = ChronosMuted,
+                                fontSize = 10.sp,
+                                modifier = Modifier.padding(horizontal = 8.dp),
+                                fontFamily = ChronosSans
+                            )
+                        }
+                    }
+                }
             }
-            VoiceSessionState.LISTENING -> {
+        }
+
+        // Active Audio Waveform Card
+        if (voiceState == VoiceSessionState.LISTENING) {
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1C1B)),
+                border = BorderStroke(1.dp, Color(0xFF33302E)),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Brush.verticalGradient(listOf(Color(0xFFFFF4EA), MaterialTheme.colorScheme.background)))
-                        .padding(horizontal = 24.dp),
+                    modifier = Modifier.padding(12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Spacer(modifier = Modifier.height(48.dp))
-                    Text("Nova is listening...", style = MaterialTheme.typography.headlineLarge, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
-                    Spacer(modifier = Modifier.height(18.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary))
-                        Spacer(modifier = Modifier.width(18.dp))
-                        Text("NOVA VOICE V2.4", color = ChronosMuted, letterSpacing = 4.sp, fontWeight = FontWeight.Black)
-                    }
-                    Spacer(modifier = Modifier.height(72.dp))
-                    AnimatedAudioWaveform(modifier = Modifier.fillMaxWidth().height(170.dp), bars = 34)
-                    Spacer(modifier = Modifier.height(64.dp))
-                    Card(
-                        shape = RoundedCornerShape(28.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                        border = BorderStroke(1.dp, Color(0xFFF0E3D8)),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(30.dp)) {
-                            Text("\"...planning my deep focus session for tomorrow morning...\"", color = Color(0xFFE1A37C), fontStyle = androidx.compose.ui.text.font.FontStyle.Italic, fontSize = 18.sp)
-                            Spacer(modifier = Modifier.height(22.dp))
-                            Text(transcript.ifEmpty { "for my research on autonomous systems. Can you also..." }, style = MaterialTheme.typography.headlineSmall, lineHeight = 38.sp)
-                            Spacer(modifier = Modifier.height(28.dp))
-                            Box(modifier = Modifier.width(7.dp).height(34.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFFE8B795)))
-                        }
-                    }
-                    Spacer(modifier = Modifier.weight(1f))
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(value = chatMessage, onValueChange = { chatMessage = it }, placeholder = { Text("Type a command...") }, shape = RoundedCornerShape(24.dp), modifier = Modifier.weight(1f))
-                        Spacer(modifier = Modifier.width(12.dp))
-                        FloatingActionButton(onClick = { if (chatMessage.isNotBlank()) { model.sendChatMessage(context, chatMessage); chatMessage = "" } }, containerColor = MaterialTheme.colorScheme.primary, shape = CircleShape) {
-                            Icon(Icons.Default.Send, contentDescription = null, tint = Color.White)
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(28.dp))
-                    FloatingActionButton(
-                        onClick = { model.endVoiceSession(context) },
-                        containerColor = ChronosRustDark,
-                        contentColor = Color.White,
-                        shape = CircleShape,
-                        modifier = Modifier.size(96.dp)
-                    ) {
-                        Icon(Icons.Default.Call, contentDescription = "Disconnect", modifier = Modifier.size(34.dp))
-                    }
-                    Spacer(modifier = Modifier.height(32.dp))
+                    Text("Voice Link Streaming Active", color = Color(0xFFE2A57E), fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = ChronosSans)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    AnimatedAudioWaveform(modifier = Modifier.fillMaxWidth().height(48.dp), bars = 24)
                 }
+            }
+        }
+
+        // Footer Input Row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = chatMessage,
+                onValueChange = { chatMessage = it },
+                placeholder = { Text("Type response or planning intent...") },
+                shape = RoundedCornerShape(24.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = ChronosPanel,
+                    unfocusedContainerColor = ChronosPanel,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = ChronosLine
+                ),
+                modifier = Modifier.weight(1f)
+            )
+            
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Microphone Voice Button
+            FloatingActionButton(
+                onClick = {
+                    if (voiceState == VoiceSessionState.IDLE) {
+                        model.startVoiceSession(context)
+                    } else {
+                        model.endVoiceSession(context)
+                    }
+                },
+                containerColor = if (voiceState != VoiceSessionState.IDLE) Color(0xFFD43A2F) else MaterialTheme.colorScheme.primary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(
+                    imageVector = if (voiceState != VoiceSessionState.IDLE) Icons.Default.Close else Icons.Default.Mic,
+                    contentDescription = "Voice Call",
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            
+            Spacer(modifier = Modifier.width(8.dp))
+            
+            FloatingActionButton(
+                onClick = {
+                    if (chatMessage.isNotBlank()) {
+                        model.updateTranscript("You: $chatMessage")
+                        model.sendChatMessage(context, chatMessage)
+                        if (voiceState == VoiceSessionState.IDLE) {
+                            model.startVoiceSession(context)
+                        }
+                        chatMessage = ""
+                    }
+                },
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(20.dp))
             }
         }
     }
@@ -908,7 +1491,7 @@ fun AIAssistantScreen(model: SatoriViewModel, context: android.content.Context) 
 // =========================================================================
 
 @Composable
-fun FocusTimerScreen() {
+fun FocusTimerScreen(model: ChronosViewModel) {
     var timerSeconds by remember { mutableStateOf(1500) } 
     var isRunning by remember { mutableStateOf(false) }
 
@@ -920,7 +1503,7 @@ fun FocusTimerScreen() {
     }
 
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        ChronosTopBar("Focus")
+        ChronosTopBar("Focus", onSettingsClick = { model.setShowSettingsDialog(true) })
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
         Column(
             modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -972,9 +1555,14 @@ fun FocusTimerScreen() {
 // =========================================================================
 
 @Composable
-fun ProfileScreen(userName: String) {
+fun ProfileScreen(model: ChronosViewModel) {
+    val userName by model.userName.collectAsState()
+    val userRole by model.userRole.collectAsState()
+    val userGoal by model.userGoal.collectAsState()
+    val userTimezone by model.userTimezone.collectAsState()
+
     Column(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        ChronosTopBar(userName)
+        ChronosTopBar(userName, onSettingsClick = { model.setShowSettingsDialog(true) })
         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
@@ -992,25 +1580,31 @@ fun ProfileScreen(userName: String) {
                     ) {
                         Text(userName.take(1).ifBlank { "A" }.uppercase(), color = Color.White, style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Black)
                     }
-                    Box(modifier = Modifier.size(42.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary)
+                            .clickable { model.setShowEditProfileDialog(true) },
+                        contentAlignment = Alignment.Center
+                    ) {
                         Icon(Icons.Default.Edit, contentDescription = "Edit", tint = Color.White, modifier = Modifier.size(20.dp))
                     }
                 }
                 Spacer(modifier = Modifier.height(18.dp))
                 Text(userName.ifBlank { "Alex Thorne" }, style = MaterialTheme.typography.headlineMedium)
-                Text("Computer Science - Year 3", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 16.sp)
+                Text(userRole, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(14.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ProfilePill("Academic Honors", Color(0xFFFFEEE4))
+                    ProfilePill(userGoal, Color(0xFFFFEEE4))
                     ProfilePill("Beta Tester", Color(0xFFE8E0D8))
                 }
             }
             item {
-                ProfilePanel("University Credentials") {
-                    ProfileMeta("INSTITUTION", "Stanford University")
-                    ProfileMeta("STUDENT ID", "STU-882-990-AI")
-                    ProfileMeta("ACADEMIC EMAIL", "a.thorne@stanford.edu")
-                    ProfileMeta("FOCUS AREA", "Neural Networks & UIX")
+                ProfilePanel("User Credentials") {
+                    ProfileMeta("ROLE / POSITION", userRole)
+                    ProfileMeta("PRIMARY GOAL", userGoal)
+                    ProfileMeta("TIMEZONE", userTimezone)
                 }
             }
             item {
@@ -1188,6 +1782,187 @@ fun NewTaskDialog(onDismiss: () -> Unit, onConfirm: (String, String, Boolean, St
 
 
 @Composable
+fun EditProfileDialog(
+    currentName: String,
+    currentRole: String,
+    currentGoal: String,
+    currentTimezone: String,
+    onDismiss: () -> Unit,
+    onConfirm: (name: String, role: String, goal: String, timezone: String) -> Unit
+) {
+    var name by remember { mutableStateOf(currentName) }
+    var role by remember { mutableStateOf(currentRole) }
+    var goal by remember { mutableStateOf(currentGoal) }
+    var timezone by remember { mutableStateOf(currentTimezone) }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Card(
+            shape = RoundedCornerShape(32.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F0E8)),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            modifier = Modifier.fillMaxWidth().padding(24.dp)
+        ) {
+            Column(modifier = Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Profile Settings", style = MaterialTheme.typography.headlineMedium)
+                        Text("Update your personal attributes", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Surface(shape = RoundedCornerShape(24.dp), color = Color(0xFFFFEFE6), border = BorderStroke(1.dp, Color(0xFFEFC9AF))) {
+                        Text("EDIT", modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
+                    }
+                }
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Display Name") },
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = role,
+                    onValueChange = { role = it },
+                    label = { Text("Role / Profession") },
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = goal,
+                    onValueChange = { goal = it },
+                    label = { Text("Primary Goal") },
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = timezone,
+                    onValueChange = { timezone = it },
+                    label = { Text("Timezone") },
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = onDismiss, shape = RoundedCornerShape(18.dp), modifier = Modifier.weight(1f).height(58.dp)) {
+                        Text("Discard", fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = { if (name.isNotBlank() && role.isNotBlank() && goal.isNotBlank() && timezone.isNotBlank()) onConfirm(name, role, goal, timezone) },
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.weight(1.25f).height(58.dp)
+                    ) {
+                        Text("Save Changes", fontWeight = FontWeight.Black)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsDialog(
+    onDismiss: () -> Unit,
+    context: android.content.Context,
+    model: ChronosViewModel
+) {
+    val prefs = context.getSharedPreferences("ChronosPrefs", android.content.Context.MODE_PRIVATE)
+    var remindersEnabled by remember { mutableStateOf(prefs.getBoolean("settings_reminders_enabled", true)) }
+    var voicePlanningEnabled by remember { mutableStateOf(prefs.getBoolean("settings_voice_planning_enabled", true)) }
+    var gatewayUrl by remember { mutableStateOf(prefs.getString("settings_gateway_url", "http://127.0.0.1:8080") ?: "http://127.0.0.1:8080") }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Card(
+            shape = RoundedCornerShape(32.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F0E8)),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            modifier = Modifier.fillMaxWidth().padding(24.dp)
+        ) {
+            Column(modifier = Modifier.padding(28.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("System Settings", style = MaterialTheme.typography.headlineMedium)
+                        Text("Configure app preferences", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Surface(shape = RoundedCornerShape(24.dp), color = Color(0xFFFFEFE6), border = BorderStroke(1.dp, Color(0xFFEFC9AF))) {
+                        Text("SYSTEM", modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Task Voice Reminders", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("Speak scheduled items aloud", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = remindersEnabled,
+                        onCheckedChange = {
+                            remindersEnabled = it
+                            prefs.edit().putBoolean("settings_reminders_enabled", it).apply()
+                        }
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("AI Daily Standup", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("Initiate voice planning every morning", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(
+                        checked = voicePlanningEnabled,
+                        onCheckedChange = {
+                            voicePlanningEnabled = it
+                            prefs.edit().putBoolean("settings_voice_planning_enabled", it).apply()
+                        }
+                    )
+                }
+
+                OutlinedTextField(
+                    value = gatewayUrl,
+                    onValueChange = {
+                        gatewayUrl = it
+                        prefs.edit().putString("settings_gateway_url", it).apply()
+                    },
+                    label = { Text("FastAPI Gateway Endpoint") },
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Button(
+                    onClick = {
+                        onDismiss()
+                        model.startTestVoiceCall(context)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth().height(58.dp)
+                ) {
+                    Icon(Icons.Default.Call, contentDescription = null, modifier = Modifier.size(24.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("Test Voice Call", fontWeight = FontWeight.Black)
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier.fillMaxWidth().height(58.dp)
+                    ) {
+                        Text("Close Settings", fontWeight = FontWeight.Black)
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
 fun OnboardingScreen(onComplete: (String, String, String) -> Unit) {
     var step by remember { mutableIntStateOf(0) }
     var name by remember { mutableStateOf("") }
@@ -1202,7 +1977,7 @@ fun OnboardingScreen(onComplete: (String, String, String) -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Satori AI", style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+        Text("Chronos AI", style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(42.dp))
         AnimatedContent(targetState = step, label = "onboarding_steps") { currentStep ->
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1314,13 +2089,432 @@ fun AnimatedAudioWaveform(
                 modifier = Modifier
                     .padding(horizontal = 2.dp)
                     .width(4.dp)
-                    .height(animHeight.dp)
+                    .height(120.dp)
+                    .graphicsLayer {
+                        scaleY = animHeight / peak
+                    }
                     .clip(RoundedCornerShape(2.dp))
                     .background(
                         Brush.verticalGradient(
                             listOf(Color(0xFFF0C7AA), MaterialTheme.colorScheme.primary, Color(0xFFF3D9C6))
                         )
                     )
+            )
+        }
+    }
+}
+
+@Composable
+fun IncomingCallOverlay(text: String, onAccept: () -> Unit, onDecline: () -> Unit) {
+    val infiniteTransition = rememberInfiniteTransition(label = "ringPulse")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.9f,
+        targetValue = 1.3f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "pulseScale"
+    )
+    val opacity by infiniteTransition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 0.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "pulseOpacity"
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF151413))
+            .clickable(enabled = false) {}, // Intercept clicks
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(32.dp)
+        ) {
+            Spacer(modifier = Modifier.height(72.dp))
+            
+            // Pulsing Avatar
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(160.dp)) {
+                Box(
+                    modifier = Modifier
+                        .size(120.dp)
+                        .graphicsLayer(scaleX = scale, scaleY = scale)
+                        .alpha(opacity)
+                        .clip(CircleShape)
+                        .background(Color(0xFFE2A57E))
+                )
+                Box(
+                    modifier = Modifier
+                        .size(100.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.linearGradient(
+                                listOf(Color(0xFFC9672A), Color(0xFF9D3E3E))
+                            )
+                        )
+                        .border(3.dp, Color(0xFFF7E5D5), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "C",
+                        color = Color.White,
+                        style = MaterialTheme.typography.displayMedium,
+                        fontWeight = FontWeight.Black
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            Text("ChronosAI", color = Color.White, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+            Text("Incoming Task Call", color = Color(0xFFA99F96), fontSize = 16.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Black)
+
+            Spacer(modifier = Modifier.height(48.dp))
+            
+            Card(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF232120)),
+                border = BorderStroke(1.dp, Color(0xFF3B3836)),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+            ) {
+                Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text,
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 48.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Decline Button
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FloatingActionButton(
+                        onClick = onDecline,
+                        containerColor = Color(0xFFD43A2F),
+                        contentColor = Color.White,
+                        shape = CircleShape,
+                        modifier = Modifier.size(76.dp)
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "Decline", modifier = Modifier.size(34.dp))
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("Decline", color = Color(0xFFA99F96), fontSize = 14.sp)
+                }
+
+                // Accept Button
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FloatingActionButton(
+                        onClick = onAccept,
+                        containerColor = Color(0xFF34A853),
+                        contentColor = Color.White,
+                        shape = CircleShape,
+                        modifier = Modifier.size(76.dp)
+                    ) {
+                        Icon(Icons.Default.Call, contentDescription = "Accept", modifier = Modifier.size(34.dp))
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("Accept", color = Color(0xFFA99F96), fontSize = 14.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ActiveCallOverlay(model: ChronosViewModel, context: android.content.Context, onHangUp: () -> Unit) {
+    val transcript by model.liveTranscript.collectAsState()
+    val activeCallText by model.activeCallText.collectAsState()
+    var callSeconds by remember { mutableStateOf(0) }
+    var chatMessage by remember { mutableStateOf("") }
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            callSeconds++
+        }
+    }
+    
+    // Automatically scroll to the end of transcript on changes
+    LaunchedEffect(transcript) {
+        if (transcript.isNotEmpty()) {
+            val lines = transcript.split("\n").filter { it.isNotBlank() }
+            if (lines.isNotEmpty()) {
+                listState.animateScrollToItem(lines.size - 1)
+            }
+        }
+    }
+
+    val minutes = callSeconds / 60
+    val seconds = callSeconds % 60
+    val timerStr = "%02d:%02d".format(minutes, seconds)
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0xFF1A1A1A), Color(0xFF0F0F0F))
+                )
+            )
+            .clickable(enabled = false) {}, // Intercept clicks
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp)
+        ) {
+            Spacer(modifier = Modifier.height(48.dp))
+            
+            Text("ChronosAI Live Link", color = Color.White, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(timerStr, color = Color(0xFFE2A57E), fontSize = 18.sp, fontWeight = FontWeight.Black)
+
+            Spacer(modifier = Modifier.height(28.dp))
+            
+            AnimatedAudioWaveform(modifier = Modifier.fillMaxWidth().height(100.dp), bars = 28)
+
+            Spacer(modifier = Modifier.height(28.dp))
+            
+            // Conversation Transcript Card
+            Card(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1C1B)),
+                border = BorderStroke(1.dp, Color(0xFF33302E)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        "Live Transcript",
+                        color = Color(0xFF8C847C),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Black,
+                        letterSpacing = 1.5.sp
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        if (transcript.isBlank()) {
+                            Text(
+                                "Connected. ChronosAI is reading the reminder...",
+                                color = Color(0xFF8C847C),
+                                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                            )
+                        } else {
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                val lines = transcript.split("\n").filter { it.isNotBlank() }
+                                items(lines) { line ->
+                                    val isMe = line.startsWith("You:")
+                                    val bubbleBg = if (isMe) Color(0xFFC9672A) else Color(0xFF2A2826)
+                                    val align = if (isMe) Alignment.End else Alignment.Start
+                                    val textColor = Color.White
+                                    
+                                    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
+                                        Surface(
+                                            shape = RoundedCornerShape(18.dp),
+                                            color = bubbleBg,
+                                            modifier = Modifier.widthIn(max = 260.dp)
+                                        ) {
+                                            Text(
+                                                text = line.substringAfter(":").trim(),
+                                                color = textColor,
+                                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                                fontSize = 15.sp
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            if (isMe) "You" else "ChronosAI",
+                                            color = Color(0xFF8C847C),
+                                            fontSize = 10.sp,
+                                            modifier = Modifier.padding(horizontal = 8.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+            
+            // Text Input field for typing commands
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = chatMessage,
+                    onValueChange = { chatMessage = it },
+                    placeholder = { Text("Type response...", color = Color(0xFF8C847C)) },
+                    shape = RoundedCornerShape(24.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Color(0xFFE2A57E),
+                        unfocusedBorderColor = Color(0xFF33302E)
+                    ),
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                FloatingActionButton(
+                    onClick = {
+                        model.onListenRequested?.invoke()
+                    },
+                    containerColor = Color(0xFFE2A57E),
+                    contentColor = Color.White,
+                    shape = CircleShape
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Speak", modifier = Modifier.size(24.dp))
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                FloatingActionButton(
+                    onClick = {
+                        if (chatMessage.isNotBlank()) {
+                            model.updateTranscript("You: $chatMessage")
+                            model.sendChatMessage(context, chatMessage)
+                            chatMessage = ""
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = Color.White,
+                    shape = CircleShape
+                ) {
+                    Icon(Icons.Default.Send, contentDescription = "Send", modifier = Modifier.size(24.dp))
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+            
+            // Disconnect Call Button
+            FloatingActionButton(
+                onClick = onHangUp,
+                containerColor = Color(0xFFD43A2F),
+                contentColor = Color.White,
+                shape = CircleShape,
+                modifier = Modifier.size(76.dp)
+            ) {
+                Icon(Icons.Default.Call, contentDescription = "Disconnect Call", modifier = Modifier.size(34.dp))
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun ChronosSplashScreen() {
+    val infiniteTransition = rememberInfiniteTransition(label = "splashPulse")
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.95f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "logoPulse"
+    )
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(4000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "logoRotate"
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(140.dp)
+                    .graphicsLayer(scaleX = scale, scaleY = scale)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(
+                            width = 2.dp,
+                            brush = Brush.sweepGradient(
+                                listOf(
+                                    MaterialTheme.colorScheme.primary,
+                                    MaterialTheme.colorScheme.secondary,
+                                    MaterialTheme.colorScheme.primary
+                                )
+                            ),
+                            shape = CircleShape
+                        )
+                )
+
+                Icon(
+                    imageVector = Icons.Default.DateRange,
+                    contentDescription = "Chronos Logo",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .size(60.dp)
+                        .graphicsLayer(rotationZ = rotation)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text(
+                text = "CHRONOS AI",
+                style = MaterialTheme.typography.displayMedium,
+                fontWeight = FontWeight.Bold,
+                fontFamily = ChronosSerif,
+                color = MaterialTheme.colorScheme.primary,
+                letterSpacing = 4.sp
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Chief of Staff",
+                style = MaterialTheme.typography.titleMedium,
+                fontFamily = ChronosSerif,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                letterSpacing = 2.sp
+            )
+
+            Spacer(modifier = Modifier.height(64.dp))
+
+            CircularProgressIndicator(
+                color = MaterialTheme.colorScheme.primary,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(36.dp)
             )
         }
     }

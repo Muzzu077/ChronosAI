@@ -33,8 +33,9 @@ async def poll_scheduled_tasks():
                 task_id = task.get("id")
                 user_id = task.get("user_id")
                 task_description = task.get("task_description")
+                priority = task.get("priority", "MEDIUM")
                 
-                print(f"Scheduler: Processing task '{task_description}' (ID: {task_id}) for user room: room-{user_id}")
+                print(f"Scheduler: Processing task '{task_description}' (ID: {task_id}, Priority: {priority}) for user room: room-{user_id}")
                 
                 room_name = f"room-{user_id}"
                 try:
@@ -44,15 +45,14 @@ async def poll_scheduled_tasks():
                         api_key=LIVEKIT_API_KEY,
                         api_secret=LIVEKIT_API_SECRET
                     )
-                    await api.room.create_room(
+                    from livekit.api import CreateRoomRequest
+                    await api.room.create_room(CreateRoomRequest(
                         name=room_name,
                         empty_timeout=600,
                         max_participants=2
-                    )
+                    ))
                     
-                    # Dispatch the reminder to the agent listening in the room via data channel
-                    import json
-                    reminder_msg = f"SYSTEM_REMINDER: {task_description}"
+                    reminder_msg = f"SYSTEM_REMINDER: {task_id} | {priority} | {task_description}"
                     from livekit.api import SendDataRequest
                     await api.room.send_data(SendDataRequest(
                         room=room_name,
@@ -66,14 +66,15 @@ async def poll_scheduled_tasks():
                     print(f"Scheduler: LiveKitAPI room connection error for {room_name}: {str(e)}")
                     
                 await db.mark_task_reminded(task_id)
-                print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in Supabase.")
+                print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in local tracker.")
         else:
             print("Scheduler: No pending tasks found at this interval.")
             
         # --- ACCOUNTABILITY LOOP ---
-        # Look for tasks that were reminded at least 5 minutes ago and are still not resolved
-        check_time_iso = (now_utc - datetime.timedelta(minutes=5)).isoformat()
-        accountability_tasks = await db.get_accountability_candidates(check_time_iso)
+        # Look for tasks that are still not resolved
+        check_time_5m = (now_utc - datetime.timedelta(minutes=5)).isoformat()
+        check_time_1m = (now_utc - datetime.timedelta(minutes=1)).isoformat()
+        accountability_tasks = await db.get_accountability_candidates(check_time_5m, check_time_1m)
         
         if accountability_tasks:
             print(f"Scheduler: Found {len(accountability_tasks)} accountability candidates.")
@@ -81,6 +82,7 @@ async def poll_scheduled_tasks():
                 task_id = task.get("id")
                 user_id = task.get("user_id")
                 task_description = task.get("task_description")
+                priority = task.get("priority", "MEDIUM")
                 
                 room_name = f"room-{user_id}"
                 try:
@@ -89,13 +91,14 @@ async def poll_scheduled_tasks():
                         api_key=LIVEKIT_API_KEY,
                         api_secret=LIVEKIT_API_SECRET
                     )
-                    await api.room.create_room(
+                    from livekit.api import CreateRoomRequest
+                    await api.room.create_room(CreateRoomRequest(
                         name=room_name,
                         empty_timeout=600,
                         max_participants=2
-                    )
+                    ))
                     
-                    accountability_msg = f"SYSTEM_ACCOUNTABILITY: {task_description}"
+                    accountability_msg = f"SYSTEM_ACCOUNTABILITY: {task_id} | {priority} | {task_description}"
                     from livekit.api import SendDataRequest
                     await api.room.send_data(SendDataRequest(
                         room=room_name,
@@ -107,8 +110,11 @@ async def poll_scheduled_tasks():
                 except Exception as e:
                     print(f"Scheduler: Accountability dispatch failed: {str(e)}")
                     
-                # Mark as accounted so we don't ask again next minute
-                await db.update_task_status(user_id, task_id, "accounted")
+                # For CRITICAL tasks, keep 'reminded' status but bump timestamp to trigger again in 1 min
+                if priority == "CRITICAL":
+                    await db.mark_task_reminded(task_id)
+                else:
+                    await db.update_task_status(user_id, task_id, "accounted")
                 
     except Exception as e:
         print(f"Scheduler error in poll cycle: {str(e)}")

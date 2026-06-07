@@ -1,20 +1,33 @@
-*.iml
-.gradle
-.kotlin
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Android & Kotlin build files
+.gradle/
+.kotlin/
+build/
+/app/build/
+captures/
+.externalNativeBuild/
+.cxx/
 local.properties
-.env
+/local.properties
 debug.keystore
+
+# IDE settings
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environment & cache
+venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Local Database & Environment
+.env
+*.db
+*.db-journal
+*.sqlite

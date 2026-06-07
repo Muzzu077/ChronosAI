@@ -22,14 +22,16 @@ if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
 # Create the FastAPI instance
 app = FastAPI(
     title="ChronosAI API Gateway",
-    description="Backend Gateway for Satori representation 'ChronosAI' AI voice planner WebRTC sessions.",
+    description="Backend Gateway for Chronos representation 'ChronosAI' AI voice planner WebRTC sessions.",
     version="1.0.0"
 )
 
-# 5.4 Allow CORS ["*"]
+# CORS configuration: Restrict allowed origins for security (can be configured in .env)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

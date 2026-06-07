@@ -31,8 +31,19 @@ class ApiClient {
     companion object {
         private const val TAG = "ApiClient"
 
-        // Redirected via adb reverse for physical USB devices.
-        private const val BASE_URL = "http://127.0.0.1:8080"
+        // Redirected via adb reverse for physical USB devices, or uses 10.0.2.2 for emulator.
+        private val BASE_URL: String
+            get() {
+                val isEmulator = android.os.Build.FINGERPRINT.startsWith("generic")
+                        || android.os.Build.FINGERPRINT.startsWith("unknown")
+                        || android.os.Build.MODEL.contains("google_sdk")
+                        || android.os.Build.MODEL.contains("Emulator")
+                        || android.os.Build.MODEL.contains("Android SDK built for x86")
+                        || android.os.Build.MANUFACTURER.contains("Genymotion")
+                        || (android.os.Build.BRAND.startsWith("generic") && android.os.Build.DEVICE.startsWith("generic"))
+                        || "google_sdk" == android.os.Build.PRODUCT
+                return if (isEmulator) "http://10.0.2.2:8080" else "http://127.0.0.1:8080"
+            }
     }
 
     suspend fun fetchLiveKitSession(userId: String): LiveKitSessionDto = withContext(Dispatchers.IO) {
@@ -75,6 +86,16 @@ class ApiClient {
     suspend fun deleteTask(userId: String, taskId: String) = withContext(Dispatchers.IO) {
         request("DELETE", "$BASE_URL/tasks/$taskId?user_id=${encode(userId)}")
     }
+
+    suspend fun updateProfile(userId: String, displayName: String, role: String, primaryGoal: String, timezone: String): JSONObject =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject()
+                .put("display_name", displayName)
+                .put("role", role)
+                .put("primary_goal", primaryGoal)
+                .put("timezone", timezone)
+            requestJson("PUT", "$BASE_URL/users/$userId/profile", body)
+        }
 
     private fun requestJson(method: String, endpoint: String, body: JSONObject? = null): JSONObject {
         val responseText = request(method, endpoint, body)
