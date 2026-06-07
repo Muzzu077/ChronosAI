@@ -67,3 +67,13 @@ from repositories.goal_repository import (
     log_goal_progress,
     get_goal_progress
 )
+
+from repositories.template_repository import (
+    create_life_template,
+    add_life_time_block,
+    get_active_life_template,
+    get_life_template_blocks,
+    ensure_default_template,
+    get_daily_checkpoints_utc
+)
+

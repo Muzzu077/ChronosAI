@@ -22,6 +22,52 @@ class ChronosAIFunctionContext(llm.ToolContext):
         super().__init__([])
         self.user_id = user_id
 
+    @llm.function_tool(description="Configure a new Life Template or activate an existing one. Replaces old active templates.")
+    async def configure_life_template(
+        self,
+        template_name: str
+    ) -> str:
+        """
+        Configure a new active Life Template.
+        """
+        try:
+            template = await db.create_life_template(self.user_id, template_name, active=1)
+            return f"Successfully created and activated Life Template: '{template_name}' (ID: {template.get('id')}). You can now add daily routine blocks to it."
+        except Exception as e:
+            print(f"[Agent Tool Error] {str(e)}")
+            return f"Error configuring life template: {str(e)}"
+
+    @llm.function_tool(description="Add a time block to the active Life Template. Supported block types: prayer, sleep, college, commute, meal, study, deep_work, personal. Priorities: fixed, preferred, flexible.")
+    async def add_template_block(
+        self,
+        block_name: str,
+        start_time: str,
+        end_time: str,
+        block_type: str,
+        priority: str = "preferred"
+    ) -> str:
+        """
+        Add a block to the active Life Template.
+        
+        Args:
+            block_name: Name of the block (e.g. 'Deep Work', 'Sleep', 'Fajr').
+            start_time: Start time in HH:MM format (e.g. '20:15', '08:00').
+            end_time: End time in HH:MM format (e.g. '01:30', '16:30').
+            block_type: Type of the block (prayer, sleep, college, commute, meal, study, deep_work, personal).
+            priority: Priority level of the block (fixed, preferred, flexible).
+        """
+        try:
+            active_temp = await db.ensure_default_template(self.user_id)
+            tid = active_temp.get("id")
+            if not tid:
+                return "Error: Could not find or establish an active Life Template."
+                
+            block = await db.add_life_time_block(tid, block_name, start_time, end_time, block_type, priority)
+            return f"Successfully added block '{block_name}' ({block_type}) to Life Template from {start_time} to {end_time} [Priority: {priority}]."
+        except Exception as e:
+            print(f"[Agent Tool Error] {str(e)}")
+            return f"Error adding block to template: {str(e)}"
+
     @llm.function_tool(description="Schedule a task or reminder for the user's daily planner. Supports exact UTC timestamps and relative phrases like 'after Maghrib', 'tomorrow morning', 'at 4 PM'.")
     async def schedule_reminder(
         self,
@@ -552,6 +598,10 @@ async def entrypoint(ctx: JobContext):
     
     prayers = await db.get_prayer_times(user_id, today_date_str)
     
+    active_template = await db.ensure_default_template(user_id)
+    template_id = active_template.get("id")
+    template_blocks = await db.get_life_template_blocks(template_id) if template_id else []
+    
     # Construct Memory Summary
     memory_summary = ""
     for m in memories:
@@ -593,6 +643,15 @@ async def entrypoint(ctx: JobContext):
             f"Asr: {prayers.get('asr')}, Maghrib: {prayers.get('maghrib')}, Isha: {prayers.get('isha')}"
         )
         
+    # Construct Life Template Blocks Summary
+    template_summary = ""
+    if template_blocks:
+        template_summary = f"\nActive Life Template Routine ('{active_template.get('template_name')}'):\n"
+        for b in template_blocks:
+            template_summary += f"- Block: '{b.get('block_name')}' | Type: {b.get('block_type')} | Time: {b.get('start_time')} - {b.get('end_time')} | Priority: {b.get('priority')}\n"
+    else:
+        template_summary = "\nNo active life template blocks configured."
+        
     all_tasks = await db.get_user_tasks(user_id)
     incomplete_tasks = [t for t in all_tasks if t.get("status") in ("pending", "reminded")]
     incomplete_summary = ""
@@ -608,11 +667,17 @@ async def entrypoint(ctx: JobContext):
         f"The server current local date and time is {current_time_str}.\n"
         "Use this as your absolute factual reference point for evaluating all relative timeline queries.\n\n"
         f"User Memory / Profile:\n{memory_summary if memory_summary else 'No prior memory stored.'}\n"
+        f"User Active Life Template Blocks:\n{template_summary}\n"
         f"{patterns_summary}\n"
         f"{goals_summary}\n"
         f"{focus_summary}\n"
         f"Today's Prayer Times:\n{prayer_summary}\n\n"
         f"Pending/Incomplete Tasks requiring accountability:\n{incomplete_summary if incomplete_summary else 'None.'}\n\n"
+        "Life Template Engine Rules:\n"
+        "1. ChronosAI uses a Life Template Engine. Instead of assigning a task to an arbitrary time, you MUST place it within the user's available preferred/flexible life blocks from the 'Active Life Template Routine' (e.g. Deep Work block, Study block).\n"
+        "2. Do not schedule tasks during Sleep, Prayer, or College/Work blocks which are marked as 'fixed' or 'prayer'.\n"
+        "3. Every day, the user only provides goals (e.g., 'Finish AI assignment'). You must place them into available blocks and call 'generate_schedule' to persist the timeline.\n"
+        "4. Avoid placing difficult tasks in hours where focus_windows indicate low productivity.\n\n"
         "Behavioral Coach Guidelines:\n"
         "1. Behavioral Learning: Analyze completion rates. Notice when the user is productive (e.g. 9 PM - 1 AM) vs when they skip (e.g. 5 PM - 7 PM). Proactively coach them: 'I've noticed you complete 95% of tasks late at night but skip early evening work. Let's move this to your peak window.'\n"
         "2. Adaptive Scheduling: When scheduling or rescheduling, prefer historical focus windows and avoid placing important work in low-productivity windows. Automatically reduce overload if they are swamped.\n"
@@ -745,19 +810,139 @@ async def entrypoint(ctx: JobContext):
                     
                 print(f"[Agent] Processing system reminder for task {task_id} ({priority}): {reminder_text}")
                 
-                if "test reminder" in reminder_text.lower():
-                    agent_say("This is a test reminder.")
-                else:
-                    if priority == "LOW":
-                        agent_say(f"SYSTEM_NOTIFICATION: Reminder: {reminder_text}")
-                    elif priority == "MEDIUM":
-                        agent_say(f"It's time for your task: {reminder_text}.")
-                    elif priority == "HIGH":
-                        agent_say(f"Hi, it is time for your high-priority scheduled task: {reminder_text}. Let's get started on this.")
-                    elif priority == "CRITICAL":
-                        agent_say(f"Urgent alert: it is time for your critical task: {reminder_text}. Please start this immediately.")
+                # Check for checkpoints (supports normalized names and case-insensitive check)
+                reminder_lower = reminder_text.lower()
+                is_checkpoint = False
+                cp_type = ""
+                if "checkpoint:" in reminder_lower:
+                    cp_type = reminder_text.split(":")[-1].strip().upper().replace(" ", "_")
+                    is_checkpoint = True
+                elif "morning standup" in reminder_lower:
+                    cp_type = "MORNING_STANDUP"
+                    is_checkpoint = True
+                elif "deep work start" in reminder_lower:
+                    cp_type = "DEEP_WORK_START"
+                    is_checkpoint = True
+                elif "accountability check" in reminder_lower:
+                    cp_type = "ACCOUNTABILITY_CHECK"
+                    is_checkpoint = True
+                elif "day review" in reminder_lower:
+                    cp_type = "DAY_REVIEW"
+                    is_checkpoint = True
                 
-                async def update_reminder_ctx():
+                if is_checkpoint:
+                    async def handle_checkpoint():
+                        # Mark checkpoint task completed immediately on Supabase so it won't repeat/ring again
+                        import uuid
+                        try:
+                            uuid.UUID(task_id)
+                            print(f"[Agent] Marking checkpoint task '{reminder_text}' (ID: {task_id}) as completed on Supabase")
+                            await db.update_task_status(user_id, task_id, "completed")
+                        except ValueError:
+                            pass
+                        except Exception as cp_err:
+                            print(f"Error updating checkpoint task status: {cp_err}")
+                            
+                        # Also mark cp_id as reminded locally in sqlite so the scheduler won't try to dispatch it again
+                        import sqlite3
+                        try:
+                            profile = await db.get_user_profile(user_id)
+                            tz_str = profile.get("timezone") or "Asia/Kolkata"
+                            try:
+                                from zoneinfo import ZoneInfo
+                                tz = ZoneInfo(tz_str)
+                            except Exception:
+                                tz = ZoneInfo("Asia/Kolkata")
+                            local_date_str = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+                            cp_id = f"checkpoint_{user_id}_{cp_type}_{local_date_str}"
+                            
+                            conn = sqlite3.connect(db.DB_FILE)
+                            cursor = conn.cursor()
+                            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            cursor.execute("""
+                            INSERT INTO task_status_tracker (task_id, status, updated_at)
+                            VALUES (?, 'reminded', ?)
+                            ON CONFLICT(task_id) DO UPDATE SET status = 'reminded', updated_at = ?
+                            """, (cp_id, now_str, now_str))
+                            conn.commit()
+                            conn.close()
+                            print(f"[Agent] Marked local checkpoint {cp_id} as reminded")
+                        except Exception as local_err:
+                            print(f"Error marking checkpoint cp_id reminded locally: {local_err}")
+                            
+                        # Connection stabilization delay
+                        await asyncio.sleep(1.0)
+                        
+                        if cp_type == "MORNING_STANDUP":
+                            agent_say(
+                                "Good morning. Today's routine schedule is loaded. "
+                                "What are your main priorities or goals today?"
+                            )
+                        elif cp_type == "DEEP_WORK_START":
+                            tasks_list = await db.get_user_tasks(user_id)
+                            # Filter out checkpoints from task list
+                            pending_tasks = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
+                            
+                            task_bullets = ""
+                            for idx, t in enumerate(pending_tasks[:3]):
+                                task_bullets += f"\n{idx+1}. {t.get('task_description')}"
+                                
+                            greeting = "Your Deep Work session is starting now."
+                            if task_bullets:
+                                greeting += f" Today's tasks are:{task_bullets}\nWhich task would you like to begin first?"
+                            else:
+                                greeting += " You don't have any tasks scheduled. What would you like to focus on?"
+                            agent_say(greeting)
+                        elif cp_type == "ACCOUNTABILITY_CHECK":
+                            tasks_list = await db.get_user_tasks(user_id)
+                            pending_tasks = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
+                            
+                            if pending_tasks:
+                                t_desc = pending_tasks[0].get("task_description")
+                                agent_say(f"Quick check-in: You planned to work on '{t_desc}'. Have you completed it, or should we reschedule?")
+                            else:
+                                agent_say("Quick check-in: How is your focus block going? Are you staying on track?")
+                        elif cp_type == "DAY_REVIEW":
+                            tasks_list = await db.get_user_tasks(user_id)
+                            completed = [t for t in tasks_list if t.get("status") == "completed" and "checkpoint" not in t.get("task_description", "").lower()]
+                            pending = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
+                            
+                            total = len(completed) + len(pending)
+                            greeting = f"It's time for your daily review. You've completed {len(completed)} out of {total} tasks today."
+                            if pending:
+                                pending_desc = ", ".join([f"'{t.get('task_description')}'" for t in pending[:2]])
+                                greeting += f" You still have pending work: {pending_desc}. Would you like me to move them to tomorrow's template?"
+                            else:
+                                greeting += " Perfect job on completing everything today! Rest up."
+                            agent_say(greeting)
+                            
+                        t_ctx = agent.chat_ctx.copy()
+                        t_ctx.add_message(
+                            role="system",
+                            content=f"[SYSTEM_NOTIFICATION] Checkpoint session triggered: {cp_type}. Guide the user through this step."
+                        )
+                        await agent.update_chat_ctx(t_ctx)
+                    
+                    asyncio.create_task(handle_checkpoint())
+                    return
+                
+                async def handle_regular_reminder():
+                    await db.mark_task_reminded(task_id)
+                    # Connection stabilization delay
+                    await asyncio.sleep(1.0)
+                    
+                    if "test reminder" in reminder_text.lower():
+                        agent_say("This is a test reminder.")
+                    else:
+                        if priority == "LOW":
+                            agent_say(f"SYSTEM_NOTIFICATION: Reminder: {reminder_text}")
+                        elif priority == "MEDIUM":
+                            agent_say(f"It's time for your task: {reminder_text}.")
+                        elif priority == "HIGH":
+                            agent_say(f"Hi, it is time for your high-priority scheduled task: {reminder_text}. Let's get started on this.")
+                        elif priority == "CRITICAL":
+                            agent_say(f"Urgent alert: it is time for your critical task: {reminder_text}. Please start this immediately.")
+                    
                     t_ctx = agent.chat_ctx.copy()
                     t_ctx.add_message(
                         role="system",
@@ -768,7 +953,8 @@ async def entrypoint(ctx: JobContext):
                         )
                     )
                     await agent.update_chat_ctx(t_ctx)
-                asyncio.create_task(update_reminder_ctx())
+                    
+                asyncio.create_task(handle_regular_reminder())
                 
             elif msg.startswith("SYSTEM_ACCOUNTABILITY:"):
                 payload = msg.replace("SYSTEM_ACCOUNTABILITY:", "").strip()
@@ -782,16 +968,19 @@ async def entrypoint(ctx: JobContext):
                     
                 print(f"[Agent] Processing system accountability check for task {task_id} ({priority}): {rem_text}")
                 
-                if priority == "LOW":
-                    agent_say(f"SYSTEM_NOTIFICATION: Accountability: Did you complete '{rem_text}'?")
-                elif priority == "MEDIUM":
-                    agent_say(f"I noticed you had '{rem_text}' scheduled. Did you manage to complete it, or should we reschedule?")
-                elif priority == "HIGH":
-                    agent_say(f"Accountability check: I see your high-priority task '{rem_text}' is still pending. Did you finish it, or do we need to reschedule?")
-                elif priority == "CRITICAL":
-                    agent_say(f"Urgent follow-up: Your critical task '{rem_text}' remains incomplete. Please tell me if you've completed it or if we should reschedule it right now.")
-                
-                async def update_accountability_ctx():
+                async def handle_regular_accountability():
+                    # Wait for connection to stabilize
+                    await asyncio.sleep(1.0)
+                    
+                    if priority == "LOW":
+                        agent_say(f"SYSTEM_NOTIFICATION: Accountability: Did you complete '{rem_text}'?")
+                    elif priority == "MEDIUM":
+                        agent_say(f"I noticed you had '{rem_text}' scheduled. Did you manage to complete it, or should we reschedule?")
+                    elif priority == "HIGH":
+                        agent_say(f"Accountability check: I see your high-priority task '{rem_text}' is still pending. Did you finish it, or do we need to reschedule?")
+                    elif priority == "CRITICAL":
+                        agent_say(f"Urgent follow-up: Your critical task '{rem_text}' remains incomplete. Please tell me if you've completed it or if we should reschedule it right now.")
+                    
                     t_ctx = agent.chat_ctx.copy()
                     t_ctx.add_message(
                         role="system",
@@ -802,7 +991,17 @@ async def entrypoint(ctx: JobContext):
                         )
                     )
                     await agent.update_chat_ctx(t_ctx)
-                asyncio.create_task(update_accountability_ctx())
+                
+                asyncio.create_task(handle_regular_accountability())
+                
+                # For CRITICAL tasks, keep status pending, otherwise move to accounted
+                if priority != "CRITICAL":
+                    async def do_accounted_update():
+                        try:
+                            await db.update_task_status(user_id, task_id, "accounted")
+                        except Exception as cp_err:
+                            print(f"Error marking task accounted: {cp_err}")
+                    asyncio.create_task(do_accounted_update())
         except Exception as e:
             print(f"Error processing system message: {e}")
 

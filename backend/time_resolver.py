@@ -49,16 +49,22 @@ async def resolve_relative_time(user_id: str, relative_phrase: str, timezone_str
     # Check for absolute ISO-like date-time format (e.g. YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
     if re.match(r'^\d{4}-\d{2}-\d{2}', phrase_raw):
         try:
-            normalized = phrase_raw.replace("Z", "")
+            if phrase_raw.endswith("Z"):
+                # It is already in UTC
+                dt = datetime.datetime.fromisoformat(phrase_raw.replace("Z", "+00:00"))
+                return dt.astimezone(datetime.timezone.utc).isoformat()
+            
             # If there's an explicit offset like +05:30 or -04:00
-            if "+" in normalized or ("-" in normalized and normalized.count("-") == 3):
-                dt = datetime.datetime.fromisoformat(normalized)
-            else:
-                normalized = normalized.replace(" ", "T")
-                if normalized.count(":") == 1:
-                    normalized += ":00"
-                dt_naive = datetime.datetime.fromisoformat(normalized)
-                dt = dt_naive.replace(tzinfo=tz)
+            if "+" in phrase_raw or (phrase_raw.count("-") == 3):
+                dt = datetime.datetime.fromisoformat(phrase_raw)
+                return dt.astimezone(datetime.timezone.utc).isoformat()
+            
+            # Treat as naive local time
+            normalized = phrase_raw.replace(" ", "T")
+            if normalized.count(":") == 1:
+                normalized += ":00"
+            dt_naive = datetime.datetime.fromisoformat(normalized)
+            dt = dt_naive.replace(tzinfo=tz)
             return dt.astimezone(datetime.timezone.utc).isoformat()
         except Exception as e:
             print(f"Error parsing absolute date-time '{phrase_raw}' in resolve_relative_time: {e}")

@@ -167,6 +167,27 @@ def init_sqlite():
         created_at TEXT,
         UNIQUE(user_id, goal_id, log_date)
     )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_life_templates (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        template_name TEXT,
+        active INTEGER DEFAULT 0,
+        created_at TEXT
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS life_time_blocks (
+        id TEXT PRIMARY KEY,
+        template_id TEXT,
+        block_name TEXT,
+        start_time TEXT,
+        end_time TEXT,
+        block_type TEXT,
+        priority TEXT,
+        FOREIGN KEY(template_id) REFERENCES user_life_templates(id) ON DELETE CASCADE
+    )""")
     
     conn.commit()
     conn.close()

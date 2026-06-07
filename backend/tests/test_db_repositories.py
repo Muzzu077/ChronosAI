@@ -102,3 +102,47 @@ async def test_agent_memory():
     memories = await db.get_agent_memories(test_user_id)
     assert len(memories) == 1
     assert memories[0].get("memory_key") == mem_key
+
+@pytest.mark.asyncio
+async def test_life_templates():
+    test_user_id = str(uuid.uuid4())
+    # Create default template
+    template = await db.ensure_default_template(test_user_id)
+    assert template.get("id") is not None
+    assert template.get("template_name") == "Default Weekly Schedule"
+    assert template.get("active") == 1
+    
+    # Verify blocks are created
+    blocks = await db.get_life_template_blocks(template.get("id"))
+    assert len(blocks) == 4
+    # Check block types
+    block_types = [b.get("block_type") for b in blocks]
+    assert "prayer" in block_types
+    assert "sleep" in block_types
+    assert "college" in block_types
+    assert "deep_work" in block_types
+
+@pytest.mark.asyncio
+async def test_checkpoint_generation():
+    test_user_id = str(uuid.uuid4())
+    # Create profile so timezone is available
+    await db.update_user_profile(test_user_id, {"timezone": "Asia/Kolkata"})
+    
+    # Ensure default template
+    await db.ensure_default_template(test_user_id)
+    
+    # Get checkpoints
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    checkpoints = await db.get_daily_checkpoints_utc(test_user_id, today_str)
+    
+    assert len(checkpoints) == 4
+    cp_types = [c.get("checkpoint_type") for c in checkpoints]
+    assert "MORNING_STANDUP" in cp_types
+    assert "DEEP_WORK_START" in cp_types
+    assert "ACCOUNTABILITY_CHECK" in cp_types
+    assert "DAY_REVIEW" in cp_types
+    
+    for cp in checkpoints:
+        assert "T" in cp.get("utc_time")
+
+

@@ -69,7 +69,124 @@ async def poll_scheduled_tasks():
                 print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in local tracker.")
         else:
             print("Scheduler: No pending tasks found at this interval.")
+
+        # --- DYNAMIC LIFE TEMPLATE CHECKPOINT LOOP ---
+        import sqlite3
+        try:
+            conn = sqlite3.connect(db.DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users")
+            user_ids = [row[0] for row in cursor.fetchall()]
+            conn.close()
             
+            cp_title_map = {
+                "MORNING_STANDUP": "Checkpoint: Morning Standup",
+                "DEEP_WORK_START": "Checkpoint: Deep Work Start",
+                "ACCOUNTABILITY_CHECK": "Checkpoint: Accountability Check",
+                "DAY_REVIEW": "Checkpoint: Day Review"
+            }
+            
+            for uid in user_ids:
+                profile = await db.get_user_profile(uid)
+                tz_str = profile.get("timezone") or "Asia/Kolkata"
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(tz_str)
+                except Exception:
+                    tz = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+                    
+                local_date_str = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+                checkpoints = await db.get_daily_checkpoints_utc(uid, local_date_str)
+                
+                # Fetch existing tasks to check if checkpoints are already inserted
+                try:
+                    user_tasks = await db.get_user_tasks(uid)
+                except Exception as t_err:
+                    print(f"Scheduler error getting tasks for {uid}: {t_err}")
+                    user_tasks = []
+                
+                for cp in checkpoints:
+                    cp_type = cp["checkpoint_type"]
+                    cp_time_str = cp["utc_time"]
+                    cp_title = cp_title_map.get(cp_type, f"Checkpoint: {cp_type}")
+                    
+                    # Check if this checkpoint task already exists for today
+                    exists = any(
+                        t.get("task_description") == cp_title and 
+                        t.get("scheduled_time")[:10] == cp_time_str[:10]
+                        for t in user_tasks
+                    )
+                    
+                    if not exists:
+                        print(f"Scheduler: Auto-populating checkpoint task '{cp_title}' at {cp_time_str} for user {uid}")
+                        try:
+                            task = await db.insert_task(uid, cp_title, cp_time_str)
+                            task_id = task.get("id")
+                            if task_id:
+                                await db.set_task_metadata(task_id, domain="Personal", priority="HIGH")
+                        except Exception as ins_err:
+                            print(f"Scheduler failed to insert checkpoint task: {ins_err}")
+                
+                for cp in checkpoints:
+                    cp_type = cp["checkpoint_type"]
+                    cp_time_str = cp["utc_time"]
+                    
+                    cp_dt = datetime.datetime.fromisoformat(cp_time_str.replace("Z", "+00:00"))
+                    if cp_dt <= now_utc and (now_utc - cp_dt).total_seconds() < 300:
+                        cp_id = f"checkpoint_{uid}_{cp_type}_{local_date_str}"
+                        
+                        status = None
+                        try:
+                            conn_check = sqlite3.connect(db.DB_FILE)
+                            cursor_check = conn_check.cursor()
+                            cursor_check.execute("SELECT status FROM task_status_tracker WHERE task_id = ?", (cp_id,))
+                            row = cursor_check.fetchone()
+                            status = row[0] if row else None
+                            conn_check.close()
+                        except Exception as check_ex:
+                            print(f"Error checking checkpoint status for {cp_id}: {check_ex}")
+                            
+                        if status != "reminded":
+                            print(f"Scheduler: Triggering Checkpoint Call for user: {uid}, Type: {cp_type} (ID: {cp_id})")
+                            room_name = f"room-{uid}"
+                            try:
+                                api = LiveKitAPI(
+                                    url=LIVEKIT_URL,
+                                    api_key=LIVEKIT_API_KEY,
+                                    api_secret=LIVEKIT_API_SECRET
+                                )
+                                from livekit.api import CreateRoomRequest
+                                await api.room.create_room(CreateRoomRequest(
+                                    name=room_name,
+                                    empty_timeout=600,
+                                    max_participants=2
+                                ))
+                                
+                                checkpoint_payload = f"SYSTEM_REMINDER: {cp_id} | HIGH | Checkpoint: {cp_type}"
+                                from livekit.api import SendDataRequest
+                                await api.room.send_data(SendDataRequest(
+                                    room=room_name,
+                                    data=checkpoint_payload.encode('utf-8'),
+                                    kind=1
+                                ))
+                                await api.aclose()
+                                
+                                conn_upd = sqlite3.connect(db.DB_FILE)
+                                cursor_upd = conn_upd.cursor()
+                                now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                                cursor_upd.execute("""
+                                INSERT INTO task_status_tracker (task_id, status, updated_at)
+                                VALUES (?, 'reminded', ?)
+                                ON CONFLICT(task_id) DO UPDATE SET status = 'reminded', updated_at = ?
+                                """, (cp_id, now_str, now_str))
+                                conn_upd.commit()
+                                conn_upd.close()
+                                print(f"Scheduler: Checkpoint {cp_id} dispatched and marked reminded.")
+                            except Exception as e:
+                                print(f"Scheduler: Checkpoint dispatch error: {e}")
+        except Exception as outer_ex:
+            print(f"Scheduler error in checkpoint poll cycle: {outer_ex}")
+
         # --- ACCOUNTABILITY LOOP ---
         # Look for tasks that are still not resolved
         check_time_5m = (now_utc - datetime.timedelta(minutes=5)).isoformat()

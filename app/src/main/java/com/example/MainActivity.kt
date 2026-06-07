@@ -107,7 +107,12 @@ class ChronosViewModel : ViewModel() {
         val currentMin = now.get(java.util.Calendar.MINUTE)
         
         for (task in currentTasks) {
-            if (task.status == ChronosTaskStatus.PENDING && !triggeredTaskIds.contains(task.id)) {
+            val isCheckpoint = task.title.startsWith("Checkpoint:") || task.title.startsWith("SYSTEM_CHECKPOINT:") || 
+                    task.title.contains("Morning Standup", ignoreCase = true) || 
+                    task.title.contains("Deep Work Start", ignoreCase = true) || 
+                    task.title.contains("Accountability Check", ignoreCase = true) || 
+                    task.title.contains("Day Review", ignoreCase = true)
+            if (task.status == ChronosTaskStatus.PENDING && !triggeredTaskIds.contains(task.id) && isCheckpoint) {
                 val timeParts = task.time.split(":")
                 if (timeParts.size == 2) {
                     var taskHour = timeParts[0].toIntOrNull() ?: 0
