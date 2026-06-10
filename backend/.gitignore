@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+chronosai.db
+chronosai.db-journal
+chronosai.db-wal
+chronosai.db-shm
+.pytest_cache/
+.DS_Store

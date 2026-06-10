@@ -14,8 +14,15 @@ import time_resolver
 # Load Environment State
 load_dotenv()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "poolside/laguna-m1")
+# Sanitize environment variables to prevent copy-paste whitespace errors from breaking LiveKit
+for key in ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_URL", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "SUPABASE_URL", "SUPABASE_KEY"]:
+    if os.getenv(key):
+        os.environ[key] = os.environ[key].strip()
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+
 
 class ChronosAIFunctionContext(llm.ToolContext):
     def __init__(self, user_id: str):
@@ -157,11 +164,7 @@ class ChronosAIFunctionContext(llm.ToolContext):
                     except Exception as ex:
                         print(f"Error shifting focus windows on reschedule: {ex}")
                 
-                res_msg = "Successfully rescheduled task"
-                if is_relative:
-                    res_msg += f" to {resolved_time} UTC (resolved '{new_datetime_iso}')."
-                else:
-                    res_msg += f" to {resolved_time} UTC."
+                res_msg = f"Successfully rescheduled task to {resolved_time} UTC (input: '{new_datetime_iso}')."
                 return res_msg
             return "Task not found or failed to reschedule."
         except Exception as e:
@@ -540,39 +543,220 @@ class ChronosAIFunctionContext(llm.ToolContext):
             print(f"[Agent Tool Error] {str(e)}")
             return f"Error analyzing productivity: {str(e)}"
 
-class MockSTT(stt.STT):
-    def __init__(self):
+import urllib.request
+import time
+
+async def query_whisper(wav_bytes, hf_token):
+    # Whisper large v3 turbo
+    url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "audio/wav"
+    }
+    
+    loop = asyncio.get_event_loop()
+    
+    def _send():
+        # Retry up to 10 times with delay for cold starts
+        for attempt in range(10):
+            try:
+                req = urllib.request.Request(url, data=wav_bytes, headers=headers, method="POST")
+                with urllib.request.urlopen(req) as res:
+                    resp_bytes = res.read()
+                    data = json.loads(resp_bytes.decode("utf-8"))
+                    if isinstance(data, dict) and "text" in data:
+                        return data["text"]
+                    elif isinstance(data, dict) and "error" in data and "loading" in data["error"]:
+                        print(f"[HF STT] Model is loading, waiting 3s (attempt {attempt+1}/10)...", flush=True)
+                        time.sleep(3)
+                        continue
+            except Exception as e:
+                # Check for HTTPError 503 or model loading
+                if hasattr(e, "code") and e.code == 503:
+                    print(f"[HF STT] Model is loading (503 Service Unavailable), waiting 3s (attempt {attempt+1}/10)...", flush=True)
+                    time.sleep(3)
+                    continue
+                print(f"[HF STT API Request Error] {e}", flush=True)
+                break
+        return ""
+        
+    return await loop.run_in_executor(None, _send)
+
+async def query_tts(text, hf_token):
+    eleven_key = (os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    if eleven_key:
+        print("[HF TTS] Using ElevenLabs for Text-to-Speech synthesis...", flush=True)
+        voice_id = (os.getenv("ELEVEN_VOICE_ID") or "Akash").strip()
+
+        voice_map = {
+            "Akash": "Akash",
+            "Rachel": "21m00Tcm4TlvDq8ikWAM",
+            "Domi": "AZnzlk1XvdvUeBnXmlld",
+            "Bella": "EXAVITQu4vr4xnSDxMaL",
+            "Antoni": "ErXwobaYiN019PkySvjV",
+            "Josh": "KYF276x1DGJy24tD5sqP",
+            "Patrick": "ODq5Fm9bW3CXAxnsPy57"
+        }
+        actual_voice = voice_map.get(voice_id, voice_id)
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{actual_voice}/stream?output_format=pcm_16000"
+        headers = {
+            "xi-api-key": eleven_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+        
+        loop = asyncio.get_event_loop()
+        
+        def _send_eleven():
+            try:
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(req) as res:
+                    return res.read()
+            except Exception as e:
+                print(f"[ElevenLabs TTS Error] {e}", flush=True)
+                if hasattr(e, "read"):
+                    print("Error details:", e.read().decode("utf-8"))
+                return None
+                
+        audio = await loop.run_in_executor(None, _send_eleven)
+        if audio:
+            return audio, 16000, 1
+
+    # Fallback to Hugging Face
+    url = "https://api-inference.huggingface.co/models/ai4bharat/indic-parler-tts"
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": text,
+        "parameters": {
+            "description": "A female speaker with a clear and natural Indian English accent, high-quality audio, studio recording."
+        }
+    }
+    
+    loop = asyncio.get_event_loop()
+    
+    def _send_hf():
+        for attempt in range(10):
+            try:
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(req) as res:
+                    return res.read()
+            except Exception as e:
+                if hasattr(e, "code") and e.code == 503:
+                    print(f"[HF TTS] Model is loading (503 Service Unavailable), waiting 3s (attempt {attempt+1}/10)...", flush=True)
+                    time.sleep(3)
+                    continue
+                print(f"[HF TTS API Request Error] {e}", flush=True)
+                break
+        return None
+        
+    wav_bytes = await loop.run_in_executor(None, _send_hf)
+    if wav_bytes:
+        try:
+            import io
+            import wave
+            wav_io = io.BytesIO(wav_bytes)
+            with wave.open(wav_io, "rb") as wav_file:
+                sample_rate = wav_file.getframerate()
+                num_channels = wav_file.getnchannels()
+                pcm_data = wav_file.readframes(wav_file.getnframes())
+                return pcm_data, sample_rate, num_channels
+        except Exception as e:
+            print(f"[HF TTS] Error parsing WAV bytes: {e}", flush=True)
+            
+    return None, 16000, 1
+
+class HFSTT(stt.STT):
+    def __init__(self, hf_token: str = None):
         super().__init__(
             capabilities=stt.STTCapabilities(streaming=False, interim_results=False, diarization=False)
         )
-    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(text="", language="en")]
-        )
+        self.hf_token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
-class MockChunkedStream(tts.ChunkedStream):
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        try:
+            if isinstance(buffer, list):
+                frames = buffer
+            else:
+                frames = [buffer]
+            
+            if not frames:
+                return stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(text="", language="en")]
+                )
+                
+            sample_rate = frames[0].sample_rate
+            num_channels = frames[0].num_channels
+            pcm_data = b"".join(f.data for f in frames)
+            
+            import io
+            import wave
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as wav_file:
+                wav_file.setnchannels(num_channels)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(pcm_data)
+            wav_bytes = wav_buf.getvalue()
+            
+            text = await query_whisper(wav_bytes, self.hf_token)
+            print(f"[HF STT] Transcribed text: '{text}'", flush=True)
+            
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(text=text, language="en")]
+            )
+        except Exception as e:
+            print(f"[HF STT Error in _recognize_impl] {e}", flush=True)
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(text="", language="en")]
+            )
+
+class HFTTSChunkedStream(tts.ChunkedStream):
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        import numpy as np
-        print(f"[Agent Speak (Mock TTS)] {self._input_text}")
+        text = self._input_text
+        print(f"[Agent Speak (HF TTS)] Synthesizing: '{text}'", flush=True)
+        
+        pcm_data, sample_rate, num_channels = await query_tts(text, self._tts.hf_token)
+        if not pcm_data:
+            print("[Agent Speak (HF TTS)] Failed to synthesize audio", flush=True)
+            return
+            
         output_emitter.initialize(
-            request_id="mock-id",
-            sample_rate=16000,
-            num_channels=1,
+            request_id=self._conn_options.request_id if self._conn_options else "hf-tts-id",
+            sample_rate=sample_rate,
+            num_channels=num_channels,
             mime_type="audio/pcm"
         )
-        # Push 100ms of silence (1600 samples at 16kHz) as raw PCM bytes
-        output_emitter.push(np.zeros(1600, dtype=np.int16).tobytes())
+        
+        chunk_size = 4000
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i:i+chunk_size]
+            output_emitter.push(chunk)
 
-class MockTTS(tts.TTS):
-    def __init__(self):
+class HFTTS(tts.TTS):
+    def __init__(self, hf_token: str = None):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False, aligned_transcript=False),
             sample_rate=16000,
             num_channels=1
         )
-    def synthesize(self, text, *, conn_options=None):
-        return MockChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+        self.hf_token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+
+    def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
+        return HFTTSChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
 
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -665,7 +849,8 @@ async def entrypoint(ctx: JobContext):
         "You MUST keep your verbal responses highly concise, direct, and tailored for oral communication.\n\n"
         "Time context (CRITICAL):\n"
         f"The server current local date and time is {current_time_str}.\n"
-        "Use this as your absolute factual reference point for evaluating all relative timeline queries.\n\n"
+        "Use this as your absolute factual reference point for evaluating all relative timeline queries.\n"
+        "When scheduling a task or reminder, always pass the raw relative time phrase (e.g. 'after 5 minutes', 'tomorrow morning', 'after Maghrib') directly to the `schedule_reminder` tool as `target_datetime_iso`, rather than trying to calculate or compute the absolute ISO timestamp yourself.\n\n"
         f"User Memory / Profile:\n{memory_summary if memory_summary else 'No prior memory stored.'}\n"
         f"User Active Life Template Blocks:\n{template_summary}\n"
         f"{patterns_summary}\n"
@@ -673,9 +858,9 @@ async def entrypoint(ctx: JobContext):
         f"{focus_summary}\n"
         f"Today's Prayer Times:\n{prayer_summary}\n\n"
         f"Pending/Incomplete Tasks requiring accountability:\n{incomplete_summary if incomplete_summary else 'None.'}\n\n"
-        "Life Template Engine Rules:\n"
-        "1. ChronosAI uses a Life Template Engine. Instead of assigning a task to an arbitrary time, you MUST place it within the user's available preferred/flexible life blocks from the 'Active Life Template Routine' (e.g. Deep Work block, Study block).\n"
-        "2. Do not schedule tasks during Sleep, Prayer, or College/Work blocks which are marked as 'fixed' or 'prayer'.\n"
+        "Life Template Rules (CRITICAL):\n"
+        "1. Daily Planning & Distributing Goals: When automatically planning or distributing general tasks/goals (e.g., 'Finish AI assignment', 'Study math'), you MUST schedule them inside the user's available preferred/flexible template blocks (e.g., Deep Work block, Study block) and completely avoid fixed blocks like sleep, prayers, or college.\n"
+        "2. Direct User Reminders & Timers: If the user directly commands you to set a reminder or schedule a task at a specific time or time offset (e.g., 'remind me to drink water after 5 minutes', 'remind me at 11 AM', 'put it now'), you MUST schedule it exactly when requested. Do not refuse, do not block it, and do not suggest a different time, even if it falls within a Sleep, Prayer, or College block. User direct commands ALWAYS take absolute precedence over the template restrictions.\n"
         "3. Every day, the user only provides goals (e.g., 'Finish AI assignment'). You must place them into available blocks and call 'generate_schedule' to persist the timeline.\n"
         "4. Avoid placing difficult tasks in hours where focus_windows indicate low productivity.\n\n"
         "Behavioral Coach Guidelines:\n"
@@ -687,7 +872,11 @@ async def entrypoint(ctx: JobContext):
         "   - MEDIUM: Notification + light voice prompt.\n"
         "   - HIGH: Detailed active voice session.\n"
         "   - CRITICAL: High-urgency repeated alert.\n"
-        "5. Chief of Staff Mode: Act like a real personal Chief of Staff. In the morning, run priorities review; during check-ins, assess focus; at night, review accountability.\n"
+        "5. Chief of Staff Mode & Autonomous Proactivity:\n"
+        "   - Act like an autonomous, proactive Chief of Staff, NOT a passive chatbot. Do not just wait for commands.\n"
+        "   - Automatically call relevant tools (like `generate_schedule`, `analyze_productivity`, `get_focus_windows`) to evaluate and optimize the user's routine, without waiting for the user to ask you to do so.\n"
+        "   - Proactively suggest optimizations. If the user joins the session, immediately analyze their schedule, identify bottlenecks, highlight goal alignment, and suggest concrete schedule blocks.\n"
+        "   - Provide accountability checks dynamically. If a task was scheduled but not completed, ask for the reason, learn from it, and adjust their future schedule template automatically.\n"
         "6. Voice Conversation Cycle: Prompt the user after executing tools. Ask clarifying questions, guide them through daily planning."
     )
     
@@ -700,12 +889,14 @@ async def entrypoint(ctx: JobContext):
         base_url="https://openrouter.ai/api/v1"
     )
     
-    stt_plugin = stt.StreamAdapter(stt=MockSTT(), vad=silero.VAD.load())
-    tts_plugin = tts.StreamAdapter(tts=MockTTS())
+    # Load VAD model ONCE and reuse to avoid ~200MB wasted RAM
+    vad_model = silero.VAD.load()
+    stt_plugin = stt.StreamAdapter(stt=HFSTT(), vad=vad_model)
+    tts_plugin = tts.StreamAdapter(tts=HFTTS())
     
     fnc_ctx = ChronosAIFunctionContext(user_id)
     agent = VoicePipelineAgent(
-        vad=silero.VAD.load(),
+        vad=vad_model,
         stt=stt_plugin,
         llm=openrouter_llm,
         tts=tts_plugin,
@@ -713,12 +904,36 @@ async def entrypoint(ctx: JobContext):
         tools=fnc_ctx.flatten(),
         instructions=system_prompt
     )
-    agent.fnc_ctx = fnc_ctx
     
+    conversation_transcript = []
+    MAX_TRANSCRIPT_LINES = 100
+
     session = AgentSession()
+
+    @session.on("conversation_item_added")
+    def on_item_added(event):
+        item = event.item
+        if isinstance(item, llm.ChatMessage):
+            role = item.role
+            text = item.text_content
+            if text:
+                if role == "user":
+                    formatted_text = f"You: {text}"
+                elif role == "assistant":
+                    formatted_text = f"ChronosAI: {text}"
+                else:
+                    return
+                print(f"[Transcript] ({role}): {text[:80]}")
+                if not conversation_transcript or conversation_transcript[-1] != formatted_text:
+                    conversation_transcript.append(formatted_text)
+                    if len(conversation_transcript) > MAX_TRANSCRIPT_LINES:
+                        del conversation_transcript[:len(conversation_transcript) - MAX_TRANSCRIPT_LINES]
+                payload = formatted_text.encode('utf-8')
+                asyncio.create_task(ctx.room.local_participant.publish_data(payload=payload, reliable=True))
+
     await session.start(agent, room=ctx.room)
 
-    conversation_transcript = []
+    greeting_triggered = False
 
     async def save_conversation_summary():
         if not conversation_transcript:
@@ -726,7 +941,7 @@ async def entrypoint(ctx: JobContext):
         clean_lines = [l for l in conversation_transcript if not l.startswith("SYSTEM_")]
         if not clean_lines:
             return
-        history_text = "\n".join(clean_lines)
+        history_text = "\n".join(clean_lines[-20:])
         summary_prompt = (
             "You are a summarization assistant. Summarize the key scheduling requests, "
             "user preferences, completed tasks, and reschedulings discussed in the following "
@@ -752,13 +967,12 @@ async def entrypoint(ctx: JobContext):
                         past_summaries = str(val)
                 
                 import datetime as dt
-                from zoneinfo import ZoneInfo
                 try:
                     local_tz = ZoneInfo(tz_str)
                 except Exception:
                     local_tz = datetime.timezone.utc
-                now_local = dt.datetime.now(local_tz)
-                timestamp = now_local.strftime("%Y-%m-%d %I:%M %p")
+                now_local_ts = dt.datetime.now(local_tz)
+                timestamp = now_local_ts.strftime("%Y-%m-%d %I:%M %p")
                 
                 new_entry = f"[{timestamp}] {summary.strip()}"
                 if past_summaries:
@@ -771,28 +985,27 @@ async def entrypoint(ctx: JobContext):
                     new_history = "\n".join(lines[-5:])
                     
                 await db.save_agent_memory(user_id, "conversation_summary", {"value": new_history})
-                print(f"[Agent Summary Save] Success: {new_history}")
+                print(f"[Agent Summary Save] Success")
         except Exception as e:
             print(f"[Agent Summary Save Error] {e}")
+
+    def publish_text(text: str):
+        payload = text.encode('utf-8')
+        asyncio.create_task(ctx.room.local_participant.publish_data(payload=payload, reliable=True))
 
     def agent_say(text: str):
         if not text.startswith("SYSTEM_NOTIFICATION:"):
             session.say(text, allow_interruptions=True)
             conversation_transcript.append(f"ChronosAI: {text}")
+            if len(conversation_transcript) > MAX_TRANSCRIPT_LINES:
+                del conversation_transcript[:len(conversation_transcript) - MAX_TRANSCRIPT_LINES]
             asyncio.create_task(save_conversation_summary())
         else:
             content = text.replace("SYSTEM_NOTIFICATION:", "").strip()
             conversation_transcript.append(f"ChronosAI [Silent Notification]: {content}")
-            
-        async def do_publish():
-            try:
-                print(f"[Agent Say / Publish] {text}")
-                await ctx.room.local_participant.publish_data(payload=text, reliable=True)
-            except Exception as e:
-                print(f"[Agent Publish Error] {e}")
-        asyncio.create_task(do_publish())
-    
-    pending_system_message = None
+            if len(conversation_transcript) > MAX_TRANSCRIPT_LINES:
+                del conversation_transcript[:len(conversation_transcript) - MAX_TRANSCRIPT_LINES]
+            publish_text(text)
 
     def process_system_message(msg: str):
         nonlocal greeting_triggered
@@ -807,10 +1020,9 @@ async def entrypoint(ctx: JobContext):
                     task_id, priority, reminder_text = parts[0], "MEDIUM", parts[1]
                 else:
                     task_id, priority, reminder_text = "unknown", "MEDIUM", payload
-                    
-                print(f"[Agent] Processing system reminder for task {task_id} ({priority}): {reminder_text}")
                 
-                # Check for checkpoints (supports normalized names and case-insensitive check)
+                print(f"[Agent] System reminder for task {task_id} ({priority}): {reminder_text}")
+                
                 reminder_lower = reminder_text.lower()
                 is_checkpoint = False
                 cp_type = ""
@@ -832,127 +1044,85 @@ async def entrypoint(ctx: JobContext):
                 
                 if is_checkpoint:
                     async def handle_checkpoint():
-                        # Mark checkpoint task completed immediately on Supabase so it won't repeat/ring again
-                        import uuid
+                        import uuid as _uuid
                         try:
-                            uuid.UUID(task_id)
-                            print(f"[Agent] Marking checkpoint task '{reminder_text}' (ID: {task_id}) as completed on Supabase")
+                            _uuid.UUID(task_id)
                             await db.update_task_status(user_id, task_id, "completed")
-                        except ValueError:
-                            pass
-                        except Exception as cp_err:
-                            print(f"Error updating checkpoint task status: {cp_err}")
-                            
-                        # Also mark cp_id as reminded locally in sqlite so the scheduler won't try to dispatch it again
-                        import sqlite3
+                        except (ValueError, Exception) as cp_err:
+                            print(f"Checkpoint status update: {cp_err}")
+                        
                         try:
-                            profile = await db.get_user_profile(user_id)
-                            tz_str = profile.get("timezone") or "Asia/Kolkata"
+                            _profile = await db.get_user_profile(user_id)
+                            _tz_str = _profile.get("timezone") or "Asia/Kolkata"
                             try:
-                                from zoneinfo import ZoneInfo
-                                tz = ZoneInfo(tz_str)
+                                _tz = ZoneInfo(_tz_str)
                             except Exception:
-                                tz = ZoneInfo("Asia/Kolkata")
-                            local_date_str = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+                                _tz = ZoneInfo("Asia/Kolkata")
+                            local_date_str = datetime.datetime.now(_tz).strftime("%Y-%m-%d")
                             cp_id = f"checkpoint_{user_id}_{cp_type}_{local_date_str}"
                             
-                            conn = sqlite3.connect(db.DB_FILE)
-                            cursor = conn.cursor()
-                            now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                            cursor.execute("""
-                            INSERT INTO task_status_tracker (task_id, status, updated_at)
-                            VALUES (?, 'reminded', ?)
-                            ON CONFLICT(task_id) DO UPDATE SET status = 'reminded', updated_at = ?
-                            """, (cp_id, now_str, now_str))
-                            conn.commit()
-                            conn.close()
-                            print(f"[Agent] Marked local checkpoint {cp_id} as reminded")
-                        except Exception as local_err:
-                            print(f"Error marking checkpoint cp_id reminded locally: {local_err}")
+                            def _mark_cp(cp_id_val, now_val):
+                                import sqlite3 as _sq
+                                conn = _sq.connect(db.DB_FILE)
+                                conn.execute("PRAGMA busy_timeout=5000")
+                                conn.execute(
+                                    "INSERT INTO task_status_tracker (task_id, status, updated_at) VALUES (?, 'reminded', ?) ON CONFLICT(task_id) DO UPDATE SET status = 'reminded', updated_at = ?",
+                                    (cp_id_val, now_val, now_val))
+                                conn.commit()
+                                conn.close()
                             
-                        # Connection stabilization delay
+                            await asyncio.to_thread(_mark_cp, cp_id, datetime.datetime.now(datetime.timezone.utc).isoformat())
+                        except Exception as local_err:
+                            print(f"Checkpoint local mark error: {local_err}")
+                            
                         await asyncio.sleep(1.0)
                         
                         if cp_type == "MORNING_STANDUP":
-                            agent_say(
-                                "Good morning. Today's routine schedule is loaded. "
-                                "What are your main priorities or goals today?"
-                            )
+                            agent_say("Good morning. Today's routine schedule is loaded. What are your main priorities or goals today?")
                         elif cp_type == "DEEP_WORK_START":
                             tasks_list = await db.get_user_tasks(user_id)
-                            # Filter out checkpoints from task list
                             pending_tasks = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
-                            
-                            task_bullets = ""
-                            for idx, t in enumerate(pending_tasks[:3]):
-                                task_bullets += f"\n{idx+1}. {t.get('task_description')}"
-                                
-                            greeting = "Your Deep Work session is starting now."
+                            task_bullets = "".join([f"\n{i+1}. {t.get('task_description')}" for i, t in enumerate(pending_tasks[:3])])
                             if task_bullets:
-                                greeting += f" Today's tasks are:{task_bullets}\nWhich task would you like to begin first?"
+                                agent_say(f"Your Deep Work session is starting now. Today's tasks are:{task_bullets}\nWhich task would you like to begin first?")
                             else:
-                                greeting += " You don't have any tasks scheduled. What would you like to focus on?"
-                            agent_say(greeting)
+                                agent_say("Your Deep Work session is starting now. You don't have any tasks scheduled. What would you like to focus on?")
                         elif cp_type == "ACCOUNTABILITY_CHECK":
                             tasks_list = await db.get_user_tasks(user_id)
                             pending_tasks = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
-                            
                             if pending_tasks:
-                                t_desc = pending_tasks[0].get("task_description")
-                                agent_say(f"Quick check-in: You planned to work on '{t_desc}'. Have you completed it, or should we reschedule?")
+                                agent_say(f"Quick check-in: You planned to work on '{pending_tasks[0].get('task_description')}'. Have you completed it, or should we reschedule?")
                             else:
                                 agent_say("Quick check-in: How is your focus block going? Are you staying on track?")
                         elif cp_type == "DAY_REVIEW":
                             tasks_list = await db.get_user_tasks(user_id)
                             completed = [t for t in tasks_list if t.get("status") == "completed" and "checkpoint" not in t.get("task_description", "").lower()]
                             pending = [t for t in tasks_list if t.get("status") in ("pending", "reminded") and "checkpoint" not in t.get("task_description", "").lower()]
-                            
                             total = len(completed) + len(pending)
-                            greeting = f"It's time for your daily review. You've completed {len(completed)} out of {total} tasks today."
+                            msg_text = f"It's time for your daily review. You've completed {len(completed)} out of {total} tasks today."
                             if pending:
                                 pending_desc = ", ".join([f"'{t.get('task_description')}'" for t in pending[:2]])
-                                greeting += f" You still have pending work: {pending_desc}. Would you like me to move them to tomorrow's template?"
+                                msg_text += f" You still have pending work: {pending_desc}. Would you like me to move them to tomorrow's template?"
                             else:
-                                greeting += " Perfect job on completing everything today! Rest up."
-                            agent_say(greeting)
-                            
-                        t_ctx = agent.chat_ctx.copy()
-                        t_ctx.add_message(
-                            role="system",
-                            content=f"[SYSTEM_NOTIFICATION] Checkpoint session triggered: {cp_type}. Guide the user through this step."
-                        )
-                        await agent.update_chat_ctx(t_ctx)
+                                msg_text += " Perfect job on completing everything today! Rest up."
+                            agent_say(msg_text)
                     
                     asyncio.create_task(handle_checkpoint())
                     return
                 
                 async def handle_regular_reminder():
                     await db.mark_task_reminded(task_id)
-                    # Connection stabilization delay
                     await asyncio.sleep(1.0)
-                    
                     if "test reminder" in reminder_text.lower():
                         agent_say("This is a test reminder.")
                     else:
-                        if priority == "LOW":
-                            agent_say(f"SYSTEM_NOTIFICATION: Reminder: {reminder_text}")
-                        elif priority == "MEDIUM":
-                            agent_say(f"It's time for your task: {reminder_text}.")
-                        elif priority == "HIGH":
-                            agent_say(f"Hi, it is time for your high-priority scheduled task: {reminder_text}. Let's get started on this.")
-                        elif priority == "CRITICAL":
-                            agent_say(f"Urgent alert: it is time for your critical task: {reminder_text}. Please start this immediately.")
-                    
-                    t_ctx = agent.chat_ctx.copy()
-                    t_ctx.add_message(
-                        role="system",
-                        content=(
-                            f"[SYSTEM_NOTIFICATION] Task reminder triggered. "
-                            f"Task ID: {task_id}, Priority: {priority}, Task Description: '{reminder_text}'. "
-                            f"If the user asks to reschedule or complete it, use the corresponding tool and refer to this Task ID."
-                        )
-                    )
-                    await agent.update_chat_ctx(t_ctx)
+                        spoken_task = reminder_text
+                        if spoken_task and spoken_task[0].isupper():
+                            words = spoken_task.split()
+                            if words and not words[0].isupper():
+                                words[0] = words[0].lower()
+                                spoken_task = " ".join(words)
+                        agent_say(f"Hi! This is your reminder call to {spoken_task}. If you have completed this task, can I mark it complete? Or would you like to reschedule it?")
                     
                 asyncio.create_task(handle_regular_reminder())
                 
@@ -966,12 +1136,10 @@ async def entrypoint(ctx: JobContext):
                 else:
                     task_id, priority, rem_text = "unknown", "MEDIUM", payload
                     
-                print(f"[Agent] Processing system accountability check for task {task_id} ({priority}): {rem_text}")
+                print(f"[Agent] Accountability check for task {task_id} ({priority}): {rem_text}")
                 
-                async def handle_regular_accountability():
-                    # Wait for connection to stabilize
+                async def handle_accountability():
                     await asyncio.sleep(1.0)
-                    
                     if priority == "LOW":
                         agent_say(f"SYSTEM_NOTIFICATION: Accountability: Did you complete '{rem_text}'?")
                     elif priority == "MEDIUM":
@@ -980,43 +1148,24 @@ async def entrypoint(ctx: JobContext):
                         agent_say(f"Accountability check: I see your high-priority task '{rem_text}' is still pending. Did you finish it, or do we need to reschedule?")
                     elif priority == "CRITICAL":
                         agent_say(f"Urgent follow-up: Your critical task '{rem_text}' remains incomplete. Please tell me if you've completed it or if we should reschedule it right now.")
-                    
-                    t_ctx = agent.chat_ctx.copy()
-                    t_ctx.add_message(
-                        role="system",
-                        content=(
-                            f"[SYSTEM_NOTIFICATION] Accountability check triggered. "
-                            f"Task ID: {task_id}, Priority: {priority}, Task Description: '{rem_text}'. "
-                            f"The user has been asked if they completed it or want to reschedule. Use tools if needed."
-                        )
-                    )
-                    await agent.update_chat_ctx(t_ctx)
                 
-                asyncio.create_task(handle_regular_accountability())
-                
-                # For CRITICAL tasks, keep status pending, otherwise move to accounted
+                asyncio.create_task(handle_accountability())
                 if priority != "CRITICAL":
-                    async def do_accounted_update():
+                    async def do_accounted():
                         try:
                             await db.update_task_status(user_id, task_id, "accounted")
-                        except Exception as cp_err:
-                            print(f"Error marking task accounted: {cp_err}")
-                    asyncio.create_task(do_accounted_update())
+                        except Exception as e:
+                            print(f"Error marking task accounted: {e}")
+                    asyncio.create_task(do_accounted())
         except Exception as e:
             print(f"Error processing system message: {e}")
 
     @ctx.room.on("data_received")
     def on_data_received(data_packet):
-        nonlocal pending_system_message
         try:
             msg = data_packet.data.decode('utf-8')
             if msg.startswith("SYSTEM_REMINDER:") or msg.startswith("SYSTEM_ACCOUNTABILITY:"):
-                has_user = any(p.identity.startswith("user-") for p in ctx.room.remote_participants.values())
-                if not has_user:
-                    print(f"[Agent] No user participant in the room yet. Queueing message: {msg}")
-                    pending_system_message = msg
-                else:
-                    process_system_message(msg)
+                process_system_message(msg)
             elif msg == "SYSTEM_HANGUP":
                 print("[Agent] Received SYSTEM_HANGUP. Saving final conversation summary.")
                 asyncio.create_task(save_conversation_summary())
@@ -1027,72 +1176,29 @@ async def entrypoint(ctx: JobContext):
                 elif "MANUAL" in msg:
                     trigger_morning_greeting()
             else:
+                # --- TEXT CHAT from Android client ---
                 print(f"[Agent] Received chat message: {msg}")
                 conversation_transcript.append(f"User: {msg}")
-                new_ctx = agent.chat_ctx.copy()
-                new_ctx.add_message(role="user", content=msg)
-                
+
                 async def respond_to_text_msg():
                     try:
-                        await agent.update_chat_ctx(new_ctx)
-                        
-                        tools = []
-                        if hasattr(agent.fnc_ctx, "function_tools") and agent.fnc_ctx.function_tools:
-                            tools = list(agent.fnc_ctx.function_tools.values())
-                        
-                        stream = openrouter_llm.chat(chat_ctx=agent.chat_ctx, tools=tools)
-                        response_text = ""
-                        tool_calls_to_run = []
-                        
-                        async for chunk in stream:
-                            if chunk.delta and chunk.delta.content:
-                                response_text += chunk.delta.content
-                            if chunk.delta and chunk.delta.tool_calls:
-                                for tc in chunk.delta.tool_calls:
-                                    tool_calls_to_run.append(tc)
-                                     
-                        if tool_calls_to_run:
-                            for tc in tool_calls_to_run:
-                                func_name = tc.name
-                                try:
-                                    args = json.loads(tc.arguments)
-                                except Exception:
-                                    args = {}
-                                if hasattr(agent.fnc_ctx, func_name):
-                                    func = getattr(agent.fnc_ctx, func_name)
-                                    print(f"[Agent Chat Tool] Executing {func_name} with {args}")
-                                    try:
-                                        res = await func(**args)
-                                        t_ctx = agent.chat_ctx.copy()
-                                        t_ctx.add_message(role="system", content=f"Tool {func_name} executed. Result: {res}")
-                                        await agent.update_chat_ctx(t_ctx)
-                                        
-                                        stream2 = openrouter_llm.chat(chat_ctx=agent.chat_ctx, tools=tools)
-                                        response_text = ""
-                                        async for chunk in stream2:
-                                            if chunk.delta and chunk.delta.content:
-                                                response_text += chunk.delta.content
-                                    except Exception as ex:
-                                        print(f"Chat Tool Error: {ex}")
-                                        
-                        if response_text:
-                            a_ctx = agent.chat_ctx.copy()
-                            a_ctx.add_message(role="assistant", content=response_text)
-                            await agent.update_chat_ctx(a_ctx)
-                            agent_say(response_text)
+                        # generate_reply handles the full LLM → TTS pipeline
+                        # conversation_item_added event auto-publishes to data channel
+                        speech = await session.generate_reply(user_input=msg)
+                        # Wait for the speech to finish playing
+                        await speech.wait_for_playout()
                     except Exception as err:
-                        import traceback
-                        traceback.print_exc()
                         print(f"Error in respond_to_text_msg: {err}")
-                        agent_say("I encountered an issue processing that.")
+                        try:
+                            agent_say("I'm sorry, could you repeat that?")
+                        except Exception:
+                            pass
                 
                 asyncio.create_task(respond_to_text_msg())
         except Exception as e:
             print(f"Data receive error: {e}")
     
-    # --- DYNAMIC MORNING STANDUP GREETING ---
-    greeting_triggered = False
-
+    # --- GREETING FUNCTIONS ---
     def trigger_test_greeting():
         nonlocal greeting_triggered
         if greeting_triggered:
@@ -1130,36 +1236,19 @@ async def entrypoint(ctx: JobContext):
 
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant):
-        nonlocal pending_system_message
-        print(f"[Agent] Participant connected: {participant.identity}")
-        if participant.identity.startswith("user-"):
-            if pending_system_message:
-                msg_to_process = pending_system_message
-                pending_system_message = None
-                print(f"[Agent] User connected. Processing queued message: {msg_to_process}")
-                process_system_message(msg_to_process)
-            else:
-                async def trigger_morning_with_delay():
-                    await asyncio.sleep(1.0)
-                    trigger_morning_greeting()
-                asyncio.create_task(trigger_morning_with_delay())
+        print(f"[Agent] Participant connected: {participant.identity}.", flush=True)
+        async def delayed_greeting():
+            await asyncio.sleep(2.0)
+            trigger_morning_greeting()
+        asyncio.create_task(delayed_greeting())
 
-    async def startup_check():
-        nonlocal pending_system_message
-        await asyncio.sleep(1.0)
-        has_user = any(p.identity.startswith("user-") for p in ctx.room.remote_participants.values())
-        if has_user:
-            if pending_system_message:
-                msg_to_process = pending_system_message
-                pending_system_message = None
-                print(f"[Agent Startup] User already present. Processing queued message: {msg_to_process}")
-                process_system_message(msg_to_process)
-            else:
-                print(f"[Agent Startup] User already present. Triggering morning greeting.")
-                trigger_morning_greeting()
+    if ctx.room.remote_participants:
+        print("[Agent Startup] Remote participants already in room.", flush=True)
+        async def delayed_greeting_startup():
+            await asyncio.sleep(2.0)
+            trigger_morning_greeting()
+        asyncio.create_task(delayed_greeting_startup())
 
-    asyncio.create_task(startup_check())
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="voice_agent"))

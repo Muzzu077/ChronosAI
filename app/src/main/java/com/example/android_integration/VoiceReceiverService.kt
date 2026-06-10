@@ -49,12 +49,7 @@ class VoiceReceiverService : Service() {
 
     private val pendingMessageQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
-    // Local Speech and Listening engines
-    private var tts: TextToSpeech? = null
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var recognizerIntent: Intent? = null
-    private var isTtsReady = false
-    private var pendingSpeak: Pair<String, Boolean>? = null
+    private var connectionMessageSent = false
 
     companion object {
         private const val TAG = "VoiceReceiverService"
@@ -64,9 +59,11 @@ class VoiceReceiverService : Service() {
         const val ACTION_START_CALL = "com.chronosai.ACTION_START_CALL"
         const val ACTION_STOP_CALL = "com.chronosai.ACTION_STOP_CALL"
         const val ACTION_SEND_CHAT = "com.chronosai.ACTION_SEND_CHAT"
+        const val ACTION_TOGGLE_SPEAKER = "com.chronosai.ACTION_TOGGLE_SPEAKER"
         const val EXTRA_JWT_TOKEN = "com.chronosai.EXTRA_JWT_TOKEN"
         const val EXTRA_SERVER_URL = "com.chronosai.EXTRA_SERVER_URL"
         const val EXTRA_CHAT_MESSAGE = "com.chronosai.EXTRA_CHAT_MESSAGE"
+        const val EXTRA_SPEAKER_ON = "com.chronosai.EXTRA_SPEAKER_ON"
 
         var activeViewModel: com.example.ChronosViewModel? = null
     }
@@ -119,53 +116,8 @@ class VoiceReceiverService : Service() {
 
         // Bind callbacks to active ViewModel
         activeViewModel?.let { vm ->
-            vm.onSpeakRequested = { text, shouldListen ->
-                speakAloud(text, shouldListen)
-            }
-            vm.onListenRequested = {
-                startListening()
-            }
-        }
-
-        // Initialize TTS
-        try {
-            tts = TextToSpeech(applicationContext) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    tts?.language = Locale.US
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                        val audioAttributes = android.media.AudioAttributes.Builder()
-                            .setUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                        tts?.setAudioAttributes(audioAttributes)
-                    }
-                    isTtsReady = true
-                    pendingSpeak?.let { (text, shouldListen) ->
-                        speakAloud(text, shouldListen)
-                        pendingSpeak = null
-                    }
-                } else {
-                    Log.e(TAG, "TTS Initialization failed with status: $status")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize TTS in service", e)
-        }
-
-        // Initialize SpeechRecognizer
-        try {
-            if (SpeechRecognizer.isRecognitionAvailable(applicationContext)) {
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(applicationContext)
-                recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                }
-            } else {
-                Log.e(TAG, "SpeechRecognizer not available on this device")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize SpeechRecognizer in service", e)
+            vm.onSpeakRequested = { _, _ -> }
+            vm.onListenRequested = {}
         }
     }
 
@@ -192,6 +144,10 @@ class VoiceReceiverService : Service() {
                     sendTextMessage(msg)
                 }
             }
+            ACTION_TOGGLE_SPEAKER -> {
+                val isOn = intent.getBooleanExtra(EXTRA_SPEAKER_ON, true)
+                setSpeakerphoneState(isOn)
+            }
         }
         
         return START_NOT_STICKY
@@ -212,12 +168,8 @@ class VoiceReceiverService : Service() {
                 
                 // Bind callbacks to active ViewModel
                 activeViewModel?.let { vm ->
-                    vm.onSpeakRequested = { text, shouldListen ->
-                        speakAloud(text, shouldListen)
-                    }
-                    vm.onListenRequested = {
-                        startListening()
-                    }
+                    vm.onSpeakRequested = { _, _ -> }
+                    vm.onListenRequested = {}
                 }
                 
                 // 1. Instantiate the LiveKit Android Room
@@ -243,16 +195,13 @@ class VoiceReceiverService : Service() {
                     token = jwtToken
                 )
 
-                // Disable the local microphone track in LiveKit to prevent resource locking with local SpeechRecognizer
-                liveKitRoom?.localParticipant?.setMicrophoneEnabled(false)
+                // Enable the local microphone track in LiveKit
+                liveKitRoom?.localParticipant?.setMicrophoneEnabled(true)
 
                 isConnected = true
                 Log.d(TAG, "Successfully connected to LiveKit Voice Room: room-user.")
                 activeViewModel?.setVoiceSessionState(com.example.VoiceSessionState.LISTENING)
                 
-                // Start listening to user voice input immediately upon connection
-                startListening()
-
                 // Flush pending messages
                 while (!pendingMessageQueue.isEmpty()) {
                     val msg = pendingMessageQueue.poll()
@@ -261,21 +210,13 @@ class VoiceReceiverService : Service() {
                     }
                 }
 
-                // If this is a call triggered by a reminder, notify the agent immediately
-                val vm = activeViewModel
-                if (vm != null) {
-                    val taskId = vm.activeCallTaskId.value
-                    val taskText = vm.activeCallText.value
-                    if (taskId == "TEST_CALL_ID" && taskText == "TEST_CALL") {
-                        sendTextMessage("SYSTEM_CONNECT: TEST_CALL")
-                    } else if (taskId.isNotEmpty() && taskText.isNotEmpty()) {
-                        val reminderMsg = "SYSTEM_REMINDER: $taskId | $taskText"
-                        sendTextMessage(reminderMsg)
-                    } else {
-                        sendTextMessage("SYSTEM_CONNECT: MANUAL")
-                    }
+                // If agent is already in the room, send connection message immediately
+                val hasRemoteParticipants = liveKitRoom?.remoteParticipants?.isNotEmpty() ?: false
+                if (hasRemoteParticipants) {
+                    Log.d(TAG, "Agent already present in the room. Sending connection message.")
+                    sendConnectionMessage()
                 } else {
-                    sendTextMessage("SYSTEM_CONNECT: MANUAL")
+                    Log.d(TAG, "Agent not present yet. Connection message deferred.")
                 }
                 
             } catch (e: Exception) {
@@ -285,11 +226,42 @@ class VoiceReceiverService : Service() {
         }
     }
 
+    private fun sendConnectionMessage() {
+        if (connectionMessageSent) return
+        connectionMessageSent = true
+        val vm = activeViewModel
+        if (vm != null) {
+            val taskId = vm.activeCallTaskId.value
+            val taskText = vm.activeCallText.value
+            Log.d(TAG, "Sending connection payload to agent: taskId=$taskId, text=$taskText")
+            if (taskId == "TEST_CALL_ID" && taskText == "TEST_CALL") {
+                sendTextMessage("SYSTEM_CONNECT: TEST_CALL")
+            } else if (taskId.isNotEmpty() && taskText.isNotEmpty()) {
+                val reminderMsg = "SYSTEM_REMINDER: $taskId | $taskText"
+                sendTextMessage(reminderMsg)
+            } else {
+                sendTextMessage("SYSTEM_CONNECT: MANUAL")
+            }
+        } else {
+            Log.d(TAG, "Sending fallback manual connection payload.")
+            sendTextMessage("SYSTEM_CONNECT: MANUAL")
+        }
+    }
+
     /**
      * Terminates connection and frees up hardware microphone resource.
      */
     private fun terminateWebRtcRoom() {
         Log.d(TAG, "Terminating LiveKit WebRTC connection context...")
+        connectionMessageSent = false
+        // Restore audio mode to normal
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_NORMAL
+            Log.d(TAG, "Audio mode restored to MODE_NORMAL.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore audio mode", e)
+        }
         serviceScope.launch {
             try {
                 // Send HUNGUP signal to backend
@@ -318,6 +290,7 @@ class VoiceReceiverService : Service() {
         when (event) {
             is RoomEvent.ParticipantConnected -> {
                 Log.i(TAG, "AI Voice Agent joined the interface: ${event.participant.identity}")
+                sendConnectionMessage()
             }
             is RoomEvent.ParticipantDisconnected -> {
                 Log.i(TAG, "AI Agent disconnected.")
@@ -334,9 +307,17 @@ class VoiceReceiverService : Service() {
                         val content = text.substringAfter("SYSTEM_NOTIFICATION:").trim()
                         activeViewModel?.updateTranscript("ChronosAI: $content")
                         showLocalNotification(content)
+                    } else if (text.startsWith("SYSTEM_REMINDER:") || 
+                               text.startsWith("SYSTEM_CONNECT:") || 
+                               text.startsWith("SYSTEM_ACCOUNTABILITY:") || 
+                               text.startsWith("SYSTEM_HANGUP")) {
+                        Log.d(TAG, "Ignoring control message: $text")
                     } else {
-                        activeViewModel?.updateTranscript(text)
-                        speakAloud(text, shouldListen = true)
+                        if (text.startsWith("You:") || text.startsWith("ChronosAI:")) {
+                            activeViewModel?.updateTranscript(text)
+                        } else {
+                            activeViewModel?.updateTranscript("ChronosAI: $text")
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error handling DataReceived event", e)
@@ -346,114 +327,7 @@ class VoiceReceiverService : Service() {
         }
     }
 
-    private fun speakAloud(text: String, shouldListen: Boolean) {
-        if (!isTtsReady) {
-            Log.d(TAG, "TTS not ready yet, queueing: $text")
-            pendingSpeak = Pair(text, shouldListen)
-            return
-        }
-        // Run on Main Thread
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            try {
-                cancelListening()
-                
-                val utteranceId = if (shouldListen) "LISTEN_AFTER_SPEAK" else "JUST_SPEAK"
-                val params = Bundle().apply {
-                    putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-                }
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {
-                        Log.d(TAG, "TTS Started speaking: $text")
-                    }
-                    override fun onDone(utteranceId: String?) {
-                        Log.d(TAG, "TTS Finished speaking: $utteranceId")
-                        if (utteranceId == "LISTEN_AFTER_SPEAK") {
-                            startListening()
-                        }
-                    }
-                    override fun onError(utteranceId: String?) {
-                        Log.e(TAG, "TTS Error for: $utteranceId")
-                    }
-                })
-                
-                Log.d(TAG, "Speaking text: $text")
-                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to speak aloud in service", e)
-            }
-        }
-    }
 
-    private fun startListening() {
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            try {
-                if (!isConnected) return@post
-                speechRecognizer?.cancel()
-                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {
-                        Log.d(TAG, "SpeechRecognizer Ready")
-                    }
-                    override fun onBeginningOfSpeech() {
-                        Log.d(TAG, "SpeechRecognizer Beginning")
-                    }
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {
-                        Log.d(TAG, "SpeechRecognizer End")
-                    }
-                    override fun onError(error: Int) {
-                        Log.e(TAG, "SpeechRecognizer Error: $error")
-                        if (isConnected) {
-                            when (error) {
-                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
-                                    Log.w(TAG, "SpeechRecognizer busy. Cancelling and restarting...")
-                                    speechRecognizer?.cancel()
-                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                        startListening()
-                                    }, 300)
-                                }
-                                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                                    Log.d(TAG, "SpeechRecognizer timeout/no-match. Restarting.")
-                                    startListening()
-                                }
-                                else -> {
-                                    Log.w(TAG, "SpeechRecognizer error: $error. Retrying in 1s to keep mic active...")
-                                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                        startListening()
-                                    }, 1000)
-                                }
-                            }
-                        }
-                    }
-                    override fun onResults(results: Bundle?) {
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        if (!matches.isNullOrEmpty()) {
-                            val spokenText = matches[0]
-                            Log.d(TAG, "SpeechRecognizer Result: $spokenText")
-                            activeViewModel?.updateTranscript("You: $spokenText")
-                            sendTextMessage(spokenText)
-                        }
-                    }
-                    override fun onPartialResults(partialResults: Bundle?) {}
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
-                speechRecognizer?.startListening(recognizerIntent)
-                Log.d(TAG, "Started listening to user mic in service...")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start speech recognition in service", e)
-            }
-        }
-    }
-
-    private fun cancelListening() {
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            try {
-                speechRecognizer?.cancel()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to cancel speech recognition in service", e)
-            }
-        }
-    }
 
     /**
      * 6.3 Configures the audio track to play through the device's main speaker stream
@@ -525,21 +399,42 @@ class VoiceReceiverService : Service() {
         notificationManager.notify(999, notification)
     }
 
+    fun setSpeakerphoneState(isOn: Boolean) {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.isSpeakerphoneOn = isOn
+            Log.d(TAG, "Speakerphone state manually set to: $isOn")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set speakerphone state", e)
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "VoiceReceiverService destroyed. Cancelling scopes.")
+        Log.d(TAG, "VoiceReceiverService destroyed. Cleaning up synchronously.")
+        // Restore audio mode
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_NORMAL
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore audio mode on destroy", e)
+        }
+        // Clear ViewModel references before cancelling scope
         activeViewModel?.let { vm ->
             vm.onSpeakRequested = null
             vm.onListenRequested = null
         }
+        // Synchronously disconnect LiveKit room (do NOT launch coroutine)
+        connectionMessageSent = false
         try {
-            tts?.stop()
-            tts?.shutdown()
-            speechRecognizer?.destroy()
+            liveKitRoom?.disconnect()
         } catch (e: Exception) {
-            Log.e(TAG, "Cleanup of TTS/SpeechRecognizer failed", e)
+            Log.e(TAG, "Error disconnecting LiveKit room on destroy", e)
         }
-        terminateWebRtcRoom()
+        liveKitRoom = null
+        isConnected = false
+        activeViewModel?.setVoiceSessionState(com.example.VoiceSessionState.IDLE)
+        // Cancel scope LAST after all cleanup is done
         serviceScope.cancel()
     }
 }

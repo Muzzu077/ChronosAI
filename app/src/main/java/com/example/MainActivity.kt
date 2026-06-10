@@ -112,7 +112,7 @@ class ChronosViewModel : ViewModel() {
                     task.title.contains("Deep Work Start", ignoreCase = true) || 
                     task.title.contains("Accountability Check", ignoreCase = true) || 
                     task.title.contains("Day Review", ignoreCase = true)
-            if (task.status == ChronosTaskStatus.PENDING && !triggeredTaskIds.contains(task.id) && isCheckpoint) {
+            if (task.status == ChronosTaskStatus.PENDING && !triggeredTaskIds.contains(task.id)) {
                 val timeParts = task.time.split(":")
                 if (timeParts.size == 2) {
                     var taskHour = timeParts[0].toIntOrNull() ?: 0
@@ -237,6 +237,19 @@ class ChronosViewModel : ViewModel() {
     private val _voiceSessionState = MutableStateFlow(VoiceSessionState.IDLE)
     val voiceSessionState = _voiceSessionState.asStateFlow()
 
+    private val _isSpeakerphoneOn = MutableStateFlow(true)
+    val isSpeakerphoneOn = _isSpeakerphoneOn.asStateFlow()
+
+    fun toggleSpeakerphone(context: android.content.Context) {
+        val target = !_isSpeakerphoneOn.value
+        _isSpeakerphoneOn.value = target
+        val intent = android.content.Intent(context, com.example.android_integration.VoiceReceiverService::class.java).apply {
+            action = com.example.android_integration.VoiceReceiverService.ACTION_TOGGLE_SPEAKER
+            putExtra(com.example.android_integration.VoiceReceiverService.EXTRA_SPEAKER_ON, target)
+        }
+        context.startService(intent)
+    }
+
     private val _liveTranscript = MutableStateFlow("")
     val liveTranscript = _liveTranscript.asStateFlow()
 
@@ -315,7 +328,6 @@ class ChronosViewModel : ViewModel() {
         _userRole.value = role
         _userGoal.value = goal
         _userTimezone.value = "Asia/Kolkata"
-        suggestInitialTasks(role, goal)
 
         viewModelScope.launch {
             try {
@@ -978,7 +990,11 @@ fun ScheduleScreen(model: ChronosViewModel, context: android.content.Context) {
                 }
             }
             item { ScreenTitle("Schedule", "View all") }
-            if (tasks.isEmpty()) {
+            val displayTasks = tasks.filter { 
+                !it.title.startsWith("Checkpoint:") && 
+                !it.title.startsWith("SYSTEM_") 
+            }
+            if (displayTasks.isEmpty()) {
                 item {
                     Box(
                         modifier = Modifier.fillMaxWidth().height(120.dp),
@@ -988,7 +1004,7 @@ fun ScheduleScreen(model: ChronosViewModel, context: android.content.Context) {
                     }
                 }
             } else {
-                items(tasks, key = { it.id }) { task ->
+                items(displayTasks, key = { it.id }) { task ->
                     TaskRowItem(task, onCheckedChange = { model.toggleTaskCompletion(task.id) }, onDelete = { model.deleteTask(task.id) })
                 }
             }
@@ -1021,40 +1037,6 @@ fun ScheduleScreen(model: ChronosViewModel, context: android.content.Context) {
                             color = MaterialTheme.colorScheme.primary,
                             trackColor = Color(0xFFE7DDD2)
                         )
-                    }
-                }
-            }
-            item {
-                Card(
-                    shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F0FE)),
-                    border = BorderStroke(1.dp, Color(0xFFADCCF8)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(24.dp)) {
-                        Text("MOCK VOICE TEST", color = Color(0xFF1A73E8), fontWeight = FontWeight.Black, letterSpacing = 2.sp)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("Creates a 'Test Reminder' scheduled for 2 minutes from now, automatically starts Nova Voice, and verifies the end-to-end voice loop.", fontSize = 14.sp)
-                        Spacer(modifier = Modifier.height(18.dp))
-                        Button(
-                            onClick = {
-                                val cal = java.util.Calendar.getInstance()
-                                cal.add(java.util.Calendar.MINUTE, 2)
-                                val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
-                                val min = cal.get(java.util.Calendar.MINUTE)
-                                val isPm = hour >= 12
-                                val hour12 = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour
-                                val timeStr = "%02d:%02d".format(hour12, min)
-                                
-                                model.addTask("Test Reminder", timeStr, isPm, "This is a test reminder.")
-                                model.startVoiceSession(context)
-                            },
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier.fillMaxWidth().height(50.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A73E8))
-                        ) {
-                            Text("START TEST", fontWeight = FontWeight.Bold, color = Color.White)
-                        }
                     }
                 }
             }
@@ -1274,11 +1256,9 @@ fun AIAssistantScreen(model: ChronosViewModel, context: android.content.Context)
                             .border(2.dp, Color(0xFFFFF6EE), CircleShape),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            Icons.Default.Face,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(40.dp)
+                        ChronosLogo(
+                            modifier = Modifier.size(40.dp),
+                            tint = Color.White
                         )
                     }
                     Text(
@@ -1445,6 +1425,24 @@ fun AIAssistantScreen(model: ChronosViewModel, context: android.content.Context)
             )
             
             Spacer(modifier = Modifier.width(8.dp))
+
+            if (voiceState != VoiceSessionState.IDLE) {
+                val speakerphoneOn by model.isSpeakerphoneOn.collectAsState()
+                FloatingActionButton(
+                    onClick = { model.toggleSpeakerphone(context) },
+                    containerColor = if (speakerphoneOn) Color(0xFFE2A57E) else Color(0xFF33302E),
+                    contentColor = Color.White,
+                    shape = CircleShape,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.VolumeUp,
+                        contentDescription = "Toggle Speakerphone",
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+            }
 
             // Microphone Voice Button
             FloatingActionButton(
@@ -1629,7 +1627,7 @@ fun ProfileScreen(model: ChronosViewModel) {
                 ProfilePanel("AI Personality") {
                     Surface(shape = RoundedCornerShape(14.dp), color = Color(0xFFFFFBF7), border = BorderStroke(1.dp, Color(0xFFE7DDD2)), modifier = Modifier.fillMaxWidth()) {
                         Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Face, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            ChronosLogo(modifier = Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
                             Spacer(modifier = Modifier.width(14.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Persona: Mentor", fontWeight = FontWeight.Black)
@@ -1989,7 +1987,7 @@ fun OnboardingScreen(onComplete: (String, String, String) -> Unit) {
                 when (currentStep) {
                     0 -> {
                         Box(modifier = Modifier.size(92.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer), contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.Face, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(54.dp))
+                            ChronosLogo(modifier = Modifier.size(54.dp), tint = MaterialTheme.colorScheme.primary)
                         }
                         Spacer(modifier = Modifier.height(32.dp))
                         Text("Welcome to ChronosAI", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Black, textAlign = TextAlign.Center)
@@ -2413,15 +2411,31 @@ fun ActiveCallOverlay(model: ChronosViewModel, context: android.content.Context,
 
             Spacer(modifier = Modifier.height(24.dp))
             
-            // Disconnect Call Button
-            FloatingActionButton(
-                onClick = onHangUp,
-                containerColor = Color(0xFFD43A2F),
-                contentColor = Color.White,
-                shape = CircleShape,
-                modifier = Modifier.size(76.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(24.dp)
             ) {
-                Icon(Icons.Default.Call, contentDescription = "Disconnect Call", modifier = Modifier.size(34.dp))
+                val speakerphoneOn by model.isSpeakerphoneOn.collectAsState()
+                FloatingActionButton(
+                    onClick = { model.toggleSpeakerphone(context) },
+                    containerColor = if (speakerphoneOn) Color(0xFFE2A57E) else Color(0xFF33302E),
+                    contentColor = Color.White,
+                    shape = CircleShape,
+                    modifier = Modifier.size(56.dp)
+                ) {
+                    Icon(Icons.Default.VolumeUp, contentDescription = "Toggle Speakerphone", modifier = Modifier.size(24.dp))
+                }
+
+                // Disconnect Call Button
+                FloatingActionButton(
+                    onClick = onHangUp,
+                    containerColor = Color(0xFFD43A2F),
+                    contentColor = Color.White,
+                    shape = CircleShape,
+                    modifier = Modifier.size(76.dp)
+                ) {
+                    Icon(Icons.Default.Call, contentDescription = "Disconnect Call", modifier = Modifier.size(34.dp))
+                }
             }
             
             Spacer(modifier = Modifier.height(32.dp))
@@ -2522,5 +2536,54 @@ fun ChronosSplashScreen() {
                 modifier = Modifier.size(36.dp)
             )
         }
+    }
+}
+
+@Composable
+fun ChronosLogo(modifier: Modifier = Modifier, tint: Color = MaterialTheme.colorScheme.primary) {
+    androidx.compose.foundation.Canvas(modifier = modifier) {
+        val center = center
+        val radius = size.minDimension / 2
+        
+        // Draw outer clock ring
+        drawCircle(
+            color = tint,
+            radius = radius * 0.9f,
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = radius * 0.12f)
+        )
+        
+        // Draw clock center dot
+        drawCircle(
+            color = tint,
+            radius = radius * 0.1f
+        )
+        
+        // Hour hand pointing to 10 o'clock (-60 degrees or 300 degrees)
+        val hourAngle = Math.toRadians(-60.0)
+        val hourLength = radius * 0.45f
+        drawLine(
+            color = tint,
+            start = center,
+            end = androidx.compose.ui.geometry.Offset(
+                x = (center.x + hourLength * Math.cos(hourAngle)).toFloat(),
+                y = (center.y + hourLength * Math.sin(hourAngle)).toFloat()
+            ),
+            strokeWidth = radius * 0.08f,
+            cap = androidx.compose.ui.graphics.StrokeCap.Round
+        )
+        
+        // Minute hand pointing to 2 o'clock (30 degrees)
+        val minuteAngle = Math.toRadians(30.0)
+        val minuteLength = radius * 0.65f
+        drawLine(
+            color = tint,
+            start = center,
+            end = androidx.compose.ui.geometry.Offset(
+                x = (center.x + minuteLength * Math.cos(minuteAngle)).toFloat(),
+                y = (center.y + minuteLength * Math.sin(minuteAngle)).toFloat()
+            ),
+            strokeWidth = radius * 0.05f,
+            cap = androidx.compose.ui.graphics.StrokeCap.Round
+        )
     }
 }

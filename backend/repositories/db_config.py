@@ -6,11 +6,12 @@ from supabase import create_client, Client
 # Load environment variables
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be configured in environment variables.")
+
 
 # Initialize Supabase Client
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -20,6 +21,10 @@ DB_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "chronos
 
 def init_sqlite():
     conn = sqlite3.connect(DB_FILE)
+    # Enable WAL mode for safe concurrent reads/writes from multiple threads
+    conn.execute("PRAGMA journal_mode=WAL")
+    # Set busy timeout to 5 seconds to avoid 'database is locked' errors
+    conn.execute("PRAGMA busy_timeout=5000")
     cursor = conn.cursor()
     
     # Create tables matching Supabase schema

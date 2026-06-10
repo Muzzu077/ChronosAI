@@ -1,16 +1,18 @@
 import os
 import datetime
 import asyncio
+import sqlite3
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from livekit.api import LiveKitAPI
+from livekit.api import LiveKitAPI, CreateRoomRequest, SendDataRequest
 import db
 
 load_dotenv()
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+LIVEKIT_URL = (os.getenv("LIVEKIT_URL") or "").strip()
+LIVEKIT_API_KEY = (os.getenv("LIVEKIT_API_KEY") or "").strip()
+LIVEKIT_API_SECRET = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+
 
 scheduler = AsyncIOScheduler()
 
@@ -38,6 +40,8 @@ async def poll_scheduled_tasks():
                 print(f"Scheduler: Processing task '{task_description}' (ID: {task_id}, Priority: {priority}) for user room: room-{user_id}")
                 
                 room_name = f"room-{user_id}"
+                dispatch_success = False
+                api = None
                 try:
                     print(f"Scheduler: Triggering RoomServiceClient to ensure room: {room_name}")
                     api = LiveKitAPI(
@@ -45,7 +49,6 @@ async def poll_scheduled_tasks():
                         api_key=LIVEKIT_API_KEY,
                         api_secret=LIVEKIT_API_SECRET
                     )
-                    from livekit.api import CreateRoomRequest
                     await api.room.create_room(CreateRoomRequest(
                         name=room_name,
                         empty_timeout=600,
@@ -53,27 +56,35 @@ async def poll_scheduled_tasks():
                     ))
                     
                     reminder_msg = f"SYSTEM_REMINDER: {task_id} | {priority} | {task_description}"
-                    from livekit.api import SendDataRequest
                     await api.room.send_data(SendDataRequest(
                         room=room_name,
                         data=reminder_msg.encode('utf-8'),
                         kind=1 # RELIABLE
                     ))
-                    await api.aclose()
+                    dispatch_success = True
                     print(f"Scheduler: Success creating/establishing livekit room: {room_name}")
                     
                 except Exception as e:
                     print(f"Scheduler: LiveKitAPI room connection error for {room_name}: {str(e)}")
+                finally:
+                    if api:
+                        try:
+                            await api.aclose()
+                        except Exception:
+                            pass
                     
-                await db.mark_task_reminded(task_id)
-                print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in local tracker.")
+                if dispatch_success:
+                    await db.mark_task_reminded(task_id)
+                    print(f"Scheduler: Completed processing task ID: {task_id}. Marked as 'reminded' in local tracker.")
+                else:
+                    print(f"Scheduler: Skipping mark_reminded for task {task_id} — dispatch failed, will retry next cycle.")
         else:
             print("Scheduler: No pending tasks found at this interval.")
 
         # --- DYNAMIC LIFE TEMPLATE CHECKPOINT LOOP ---
-        import sqlite3
         try:
             conn = sqlite3.connect(db.DB_FILE)
+            conn.execute("PRAGMA busy_timeout=5000")
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM users")
             user_ids = [row[0] for row in cursor.fetchall()]
@@ -113,7 +124,7 @@ async def poll_scheduled_tasks():
                     # Check if this checkpoint task already exists for today
                     exists = any(
                         t.get("task_description") == cp_title and 
-                        t.get("scheduled_time")[:10] == cp_time_str[:10]
+                        t.get("scheduled_time", "")[:10] == cp_time_str[:10]
                         for t in user_tasks
                     )
                     
@@ -149,13 +160,13 @@ async def poll_scheduled_tasks():
                         if status != "reminded":
                             print(f"Scheduler: Triggering Checkpoint Call for user: {uid}, Type: {cp_type} (ID: {cp_id})")
                             room_name = f"room-{uid}"
+                            api = None
                             try:
                                 api = LiveKitAPI(
                                     url=LIVEKIT_URL,
                                     api_key=LIVEKIT_API_KEY,
                                     api_secret=LIVEKIT_API_SECRET
                                 )
-                                from livekit.api import CreateRoomRequest
                                 await api.room.create_room(CreateRoomRequest(
                                     name=room_name,
                                     empty_timeout=600,
@@ -163,15 +174,14 @@ async def poll_scheduled_tasks():
                                 ))
                                 
                                 checkpoint_payload = f"SYSTEM_REMINDER: {cp_id} | HIGH | Checkpoint: {cp_type}"
-                                from livekit.api import SendDataRequest
                                 await api.room.send_data(SendDataRequest(
                                     room=room_name,
                                     data=checkpoint_payload.encode('utf-8'),
                                     kind=1
                                 ))
-                                await api.aclose()
                                 
                                 conn_upd = sqlite3.connect(db.DB_FILE)
+                                conn_upd.execute("PRAGMA busy_timeout=5000")
                                 cursor_upd = conn_upd.cursor()
                                 now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
                                 cursor_upd.execute("""
@@ -184,6 +194,12 @@ async def poll_scheduled_tasks():
                                 print(f"Scheduler: Checkpoint {cp_id} dispatched and marked reminded.")
                             except Exception as e:
                                 print(f"Scheduler: Checkpoint dispatch error: {e}")
+                            finally:
+                                if api:
+                                    try:
+                                        await api.aclose()
+                                    except Exception:
+                                        pass
         except Exception as outer_ex:
             print(f"Scheduler error in checkpoint poll cycle: {outer_ex}")
 
@@ -202,13 +218,13 @@ async def poll_scheduled_tasks():
                 priority = task.get("priority", "MEDIUM")
                 
                 room_name = f"room-{user_id}"
+                api = None
                 try:
                     api = LiveKitAPI(
                         url=LIVEKIT_URL,
                         api_key=LIVEKIT_API_KEY,
                         api_secret=LIVEKIT_API_SECRET
                     )
-                    from livekit.api import CreateRoomRequest
                     await api.room.create_room(CreateRoomRequest(
                         name=room_name,
                         empty_timeout=600,
@@ -216,16 +232,20 @@ async def poll_scheduled_tasks():
                     ))
                     
                     accountability_msg = f"SYSTEM_ACCOUNTABILITY: {task_id} | {priority} | {task_description}"
-                    from livekit.api import SendDataRequest
                     await api.room.send_data(SendDataRequest(
                         room=room_name,
                         data=accountability_msg.encode('utf-8'),
                         kind=1 # RELIABLE
                     ))
-                    await api.aclose()
                     print(f"Scheduler: Dispatched accountability query for '{task_description}'")
                 except Exception as e:
                     print(f"Scheduler: Accountability dispatch failed: {str(e)}")
+                finally:
+                    if api:
+                        try:
+                            await api.aclose()
+                        except Exception:
+                            pass
                     
                 # For CRITICAL tasks, keep 'reminded' status but bump timestamp to trigger again in 1 min
                 if priority == "CRITICAL":

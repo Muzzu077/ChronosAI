@@ -31,9 +31,15 @@ class ApiClient {
     companion object {
         private const val TAG = "ApiClient"
 
-        // Redirected via adb reverse for physical USB devices, or uses 10.0.2.2 for emulator.
+        // Put your Hugging Face Space URL here (e.g. "https://username-space-name.hf.space")
+        // If empty, falls back to local adb reverse (http://127.0.0.1:8080)
+        private const val CLOUD_URL = "https://muzzu077-chronosai-backend.hf.space"
+
         private val BASE_URL: String
             get() {
+                if (CLOUD_URL.isNotEmpty()) {
+                    return CLOUD_URL
+                }
                 val isEmulator = android.os.Build.FINGERPRINT.startsWith("generic")
                         || android.os.Build.FINGERPRINT.startsWith("unknown")
                         || android.os.Build.MODEL.contains("google_sdk")

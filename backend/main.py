@@ -1,9 +1,9 @@
 import os
 import uuid
 import datetime
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from livekit.api import AccessToken, VideoGrants
+from livekit.api import AccessToken, VideoGrants, LiveKitAPI, CreateAgentDispatchRequest
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -13,11 +13,18 @@ from scheduler import start_scheduler
 
 load_dotenv()
 
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+# Sanitize environment variables to prevent copy-paste whitespace errors from breaking LiveKit
+for key in ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_URL", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "SUPABASE_URL", "SUPABASE_KEY"]:
+    if os.getenv(key):
+        os.environ[key] = os.environ[key].strip()
+
+LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
+
 
 if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
     raise ValueError("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be configured in environment variables.")
+
 
 # Create the FastAPI instance
 app = FastAPI(
@@ -25,6 +32,12 @@ app = FastAPI(
     description="Backend Gateway for Chronos representation 'ChronosAI' AI voice planner WebRTC sessions.",
     version="1.0.0"
 )
+
+
+
+
+
+
 
 # CORS configuration: Restrict allowed origins for security (can be configured in .env)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -241,8 +254,34 @@ async def update_daily_log(user_id: uuid.UUID, log_date: datetime.date = Query(.
         raise HTTPException(status_code=500, detail=f"Failed to update daily log: {str(e)}")
 
 
+async def dispatch_agent_background(room_name: str):
+    try:
+        url = (os.getenv("LIVEKIT_URL") or "wss://voice-call-aelv823z.livekit.cloud").strip()
+        key = (os.getenv("LIVEKIT_API_KEY") or "").strip()
+        secret = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+        
+        if not key or not secret:
+            print("[Gateway Dispatch Warning] Missing LiveKit credentials for agent dispatch.")
+            return
+
+        print(f"[Gateway Dispatch] Attempting to dispatch 'voice_agent' to: {room_name}")
+        async with LiveKitAPI(url, key, secret) as lkapi:
+            res = await lkapi.agent_dispatch.create_dispatch(
+                CreateAgentDispatchRequest(
+                    agent_name="voice_agent",
+                    room=room_name
+                )
+            )
+            print(f"[Gateway Dispatch Success] Dispatched agent. Dispatch ID: {res.id}")
+    except Exception as e:
+        print(f"[Gateway Dispatch Error] Failed to dispatch agent: {str(e)}")
+
+
 @app.get("/get-listen-token")
-def get_listen_token(user_id: str = Query(..., description="The Unique ID (UUID) of the client user to authenticate room partition.")):
+def get_listen_token(
+    user_id: str = Query(..., description="The Unique ID (UUID) of the client user to authenticate room partition."),
+    background_tasks: BackgroundTasks = None
+):
     """5.4 Token REST Gateway endpoint: Validates user_id, generates a scoped LiveKit connection JWT."""
     # Simple validation of user_id to ensure it's not empty/malformed
     if not user_id or len(user_id.strip()) < 3:
@@ -257,10 +296,16 @@ def get_listen_token(user_id: str = Query(..., description="The Unique ID (UUID)
         
         # Instantiate a LiveKit AccessToken
         # Grant capabilities: join room, subscribe to feeds, publish micro media
+        if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+            raise HTTPException(
+                status_code=500,
+                detail="LiveKit credentials (LIVEKIT_API_KEY, LIVEKIT_API_SECRET) are not configured on the server."
+            )
         token = AccessToken(
             api_key=LIVEKIT_API_KEY,
             api_secret=LIVEKIT_API_SECRET
         )
+
         
         grants = VideoGrants(
             room_join=True,
@@ -277,13 +322,17 @@ def get_listen_token(user_id: str = Query(..., description="The Unique ID (UUID)
         
         signed_jwt = token.to_jwt()
         
+        if background_tasks:
+            background_tasks.add_task(dispatch_agent_background, room_name)
+        
         return {
             "token": signed_jwt,
             "room_name": room_name,
             "identity": identity,
-            "server_url": os.getenv("LIVEKIT_URL", "wss://voice-call-aelv823z.livekit.cloud")
+            "server_url": (os.getenv("LIVEKIT_URL") or "wss://voice-call-aelv823z.livekit.cloud").strip()
         }
-        
+
+
     except Exception as e:
         print(f"Error generating AccessToken: {str(e)}")
         raise HTTPException(
