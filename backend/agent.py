@@ -548,7 +548,18 @@ import time
 
 async def query_whisper(wav_bytes, hf_token):
     # Whisper large v3 turbo
-    url = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+    try:
+        from huggingface_hub import InferenceClient
+        client = InferenceClient(token=hf_token, provider='hf-inference')
+        # We can pass wav_bytes directly to automatic_speech_recognition
+        output = client.automatic_speech_recognition(wav_bytes, model="openai/whisper-large-v3-turbo")
+        if output and getattr(output, "text", None):
+            return output.text
+    except Exception as e:
+        print(f"[InferenceClient Whisper Error] {e}, trying raw HTTP request to router...", flush=True)
+
+    # Fallback to direct request with new router URL
+    url = "https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo"
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "audio/wav"
@@ -629,8 +640,55 @@ async def query_tts(text, hf_token):
         if audio:
             return audio, 16000, 1
 
-    # Fallback to Hugging Face
-    url = "https://api-inference.huggingface.co/models/ai4bharat/indic-parler-tts"
+    # Fallback to edge-tts (High quality, free, Microsoft Edge TTS)
+    try:
+        import edge_tts
+        import av
+        import io
+        
+        voice_id = (os.getenv("ELEVEN_VOICE_ID") or "Neerja").strip()
+        voice_map = {
+            "Neerja": "en-IN-NeerjaNeural",
+            "Prabhat": "en-IN-PrabhatNeural",
+            "Akash": "en-IN-NeerjaNeural"
+        }
+        edge_voice = voice_map.get(voice_id, "en-IN-NeerjaNeural")
+        
+        print(f"[edge-tts] Synthesizing speech using voice: {edge_voice}...", flush=True)
+        communicate = edge_tts.Communicate(text, edge_voice)
+        mp3_bytes = b""
+        
+        async def _run_edge_tts():
+            nonlocal mp3_bytes
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_bytes += chunk["data"]
+                    
+        # Since we are in an async def query_tts, we can directly await
+        await _run_edge_tts()
+                
+        if mp3_bytes:
+            # Decode MP3 to PCM 16000Hz mono using PyAV
+            input_file = io.BytesIO(mp3_bytes)
+            container = av.open(input_file)
+            resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+            
+            pcm_chunks = []
+            stream = container.streams.audio[0]
+            for frame in container.decode(stream):
+                resampled_frames = resampler.resample(frame)
+                for rf in resampled_frames:
+                    pcm_chunks.append(bytes(rf.planes[0]))
+            
+            pcm_data = b"".join(pcm_chunks)
+            if pcm_data:
+                print(f"[edge-tts] Successfully synthesized {len(pcm_data)} PCM bytes", flush=True)
+                return pcm_data, 16000, 1
+    except Exception as e:
+        print(f"[edge-tts Error] {e}. Falling back to Hugging Face serverless...", flush=True)
+
+    # Secondary Fallback to Hugging Face router API
+    url = "https://router.huggingface.co/hf-inference/models/ai4bharat/indic-parler-tts"
     headers = {
         "Authorization": f"Bearer {hf_token}",
         "Content-Type": "application/json"
@@ -645,14 +703,14 @@ async def query_tts(text, hf_token):
     loop = asyncio.get_event_loop()
     
     def _send_hf():
-        for attempt in range(10):
+        for attempt in range(5):
             try:
                 req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
                 with urllib.request.urlopen(req) as res:
                     return res.read()
             except Exception as e:
                 if hasattr(e, "code") and e.code == 503:
-                    print(f"[HF TTS] Model is loading (503 Service Unavailable), waiting 3s (attempt {attempt+1}/10)...", flush=True)
+                    print(f"[HF TTS] Model is loading (503 Service Unavailable), waiting 3s (attempt {attempt+1}/5)...", flush=True)
                     time.sleep(3)
                     continue
                 print(f"[HF TTS API Request Error] {e}", flush=True)

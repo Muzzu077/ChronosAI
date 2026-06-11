@@ -313,9 +313,10 @@ class VoiceReceiverService : Service() {
                                text.startsWith("SYSTEM_HANGUP")) {
                         Log.d(TAG, "Ignoring control message: $text")
                     } else {
-                        if (text.startsWith("You:") || text.startsWith("ChronosAI:")) {
+                        // Skip "You:" messages from data channel - already shown locally when user typed it
+                        if (text.startsWith("ChronosAI:")) {
                             activeViewModel?.updateTranscript(text)
-                        } else {
+                        } else if (!text.startsWith("You:")) {
                             activeViewModel?.updateTranscript("ChronosAI: $text")
                         }
                     }

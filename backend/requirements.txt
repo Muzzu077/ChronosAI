@@ -9,3 +9,5 @@ supabase>=2.0.0
 apscheduler>=3.10.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+edge-tts>=6.0.0
+
