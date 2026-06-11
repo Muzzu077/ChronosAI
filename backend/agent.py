@@ -945,11 +945,23 @@ async def entrypoint(ctx: JobContext):
     initial_ctx = llm.ChatContext()
     initial_ctx.add_message(role="system", content=system_prompt)
     
-    openrouter_llm = openai.LLM(
-        model=OPENROUTER_MODEL,
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1"
-    )
+    # Load LLM: Prefer Hugging Face Serverless Llama 3.1 Instruct if HF_TOKEN is available,
+    # otherwise fall back to OpenRouter.
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if hf_token:
+        print("[Agent Startup] Initializing Hugging Face Serverless LLM (meta-llama/Llama-3.1-8B-Instruct)...", flush=True)
+        openrouter_llm = openai.LLM(
+            model="meta-llama/Llama-3.1-8B-Instruct",
+            api_key=hf_token,
+            base_url="https://router.huggingface.co/v1"
+        )
+    else:
+        print("[Agent Startup] Initializing OpenRouter LLM...", flush=True)
+        openrouter_llm = openai.LLM(
+            model=OPENROUTER_MODEL,
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1"
+        )
     
     # Load VAD model ONCE and reuse to avoid ~200MB wasted RAM
     vad_model = silero.VAD.load()
