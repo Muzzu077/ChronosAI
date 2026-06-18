@@ -945,13 +945,13 @@ async def entrypoint(ctx: JobContext):
     initial_ctx = llm.ChatContext()
     initial_ctx.add_message(role="system", content=system_prompt)
     
-    # Load LLM: Prefer Hugging Face Serverless Llama 3.1 Instruct if HF_TOKEN is available,
+    # Load LLM: Prefer Hugging Face Serverless Qwen 2.5 72B Instruct if HF_TOKEN is available,
     # otherwise fall back to OpenRouter.
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
     if hf_token:
-        print("[Agent Startup] Initializing Hugging Face Serverless LLM (meta-llama/Llama-3.1-8B-Instruct)...", flush=True)
+        print("[Agent Startup] Initializing Hugging Face Serverless LLM (Qwen/Qwen2.5-72B-Instruct)...", flush=True)
         openrouter_llm = openai.LLM(
-            model="meta-llama/Llama-3.1-8B-Instruct",
+            model="Qwen/Qwen2.5-72B-Instruct",
             api_key=hf_token,
             base_url="https://router.huggingface.co/v1"
         )
