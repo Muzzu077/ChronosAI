@@ -543,6 +543,293 @@ class ChronosAIFunctionContext(llm.ToolContext):
             print(f"[Agent Tool Error] {str(e)}")
             return f"Error analyzing productivity: {str(e)}"
 
+    @llm.function_tool(description="Get an AI-optimized scheduling recommendation for a list of tasks/goals based on historical focus windows and available template blocks.")
+    async def get_adaptive_schedule_recommendation(
+        self,
+        tasks_json: str,  # e.g. '[{"activity": "AI Assignment", "priority": "HIGH"}, {"activity": "DSA", "priority": "MEDIUM"}]'
+        schedule_date: str # e.g. "2026-06-18"
+    ) -> str:
+        try:
+            print(f"[Agent Tool Invoke] get_adaptive_schedule_recommendation for {schedule_date}")
+            tasks = json.loads(tasks_json)
+            
+            # 1. Fetch active template
+            active_temp = await db.ensure_default_template(self.user_id)
+            tid = active_temp.get("id")
+            blocks = await db.get_life_template_blocks(tid) if tid else []
+            
+            if not blocks:
+                return "No life template blocks configured. Please set up a life template first."
+                
+            # 2. Get focus windows scores
+            focus_windows = await db.get_focus_windows(self.user_id)
+            fw_map = {}
+            for fw in focus_windows:
+                fw_map[(fw.get("hour_of_day"), fw.get("category"))] = fw.get("productivity_score", 0.5)
+                
+            # 3. Identify available slots
+            available_slots = []
+            for b in blocks:
+                btype = b.get("block_type")
+                if btype in ("sleep", "college", "prayer"):
+                    continue
+                    
+                start_str = b.get("start_time", "09:00")
+                end_str = b.get("end_time", "17:00")
+                
+                try:
+                    h_start, m_start = map(int, start_str.split(":"))
+                    h_end, m_end = map(int, end_str.split(":"))
+                    
+                    start_mins = h_start * 60 + m_start
+                    end_mins = h_end * 60 + m_end
+                    if end_mins < start_mins:
+                        end_mins += 24 * 60
+                        
+                    current_mins = start_mins
+                    while current_mins + 60 <= end_mins:
+                        slot_hour = (current_mins // 60) % 24
+                        slot_start_str = f"{slot_hour:02d}:{(current_mins % 60):02d}"
+                        slot_end_str = f"{((current_mins + 60) // 60) % 24:02d}:{((current_mins + 60) % 60):02d}"
+                        
+                        score = fw_map.get((slot_hour, b.get("block_name")), 0.5)
+                        available_slots.append({
+                            "hour": slot_hour,
+                            "start": slot_start_str,
+                            "end": slot_end_str,
+                            "block_name": b.get("block_name"),
+                            "score": score
+                        })
+                        current_mins += 60
+                except Exception as parse_ex:
+                    print(f"Error parsing template block times: {parse_ex}")
+                    
+            if not available_slots:
+                return "No available flexible/preferred slots in your active template routine to schedule tasks today."
+                
+            available_slots.sort(key=lambda s: s["score"], reverse=True)
+            
+            priority_weights = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            tasks.sort(key=lambda t: priority_weights.get(t.get("priority", "MEDIUM").upper(), 2), reverse=True)
+            
+            recommendations = []
+            slot_idx = 0
+            for task in tasks:
+                if slot_idx >= len(available_slots):
+                    recommendations.append({
+                        "task": task.get("activity"),
+                        "status": "unscheduled",
+                        "reason": "Out of available template slots for today."
+                    })
+                    continue
+                    
+                slot = available_slots[slot_idx]
+                recommendations.append({
+                    "task": task.get("activity"),
+                    "status": "scheduled",
+                    "start": slot["start"],
+                    "end": slot["end"],
+                    "block_name": slot["block_name"],
+                    "score": slot["score"],
+                    "priority": task.get("priority", "MEDIUM")
+                })
+                slot_idx += 1
+                
+            res = f"### AI Adaptive Schedule Recommendation for {schedule_date}\n\n"
+            res += "Based on your historical Focus Windows and active Life Template, here is the optimized plan:\n\n"
+            res += "| Time Slot | Activity | Category | Focus Score | Priority |\n"
+            res += "| --- | --- | --- | --- | --- |\n"
+            
+            scheduled_blocks = []
+            for r in recommendations:
+                if r["status"] == "scheduled":
+                    score_pct = int(r["score"] * 100)
+                    res += f"| **{r['start']} - {r['end']}** | {r['task']} | {r['block_name']} | {score_pct}% | {r['priority']} |\n"
+                    scheduled_blocks.append({
+                        "start": r["start"],
+                        "end": r["end"],
+                        "activity": r["task"],
+                        "domain": r["block_name"],
+                        "priority": r["priority"]
+                    })
+                else:
+                    res += f"| *Unscheduled* | {r['task']} | - | - | {r['reason']} |\n"
+                    
+            res += "\n**Why this layout?**\n"
+            res += "- High priority tasks have been automatically routed to your highest focus windows.\n"
+            res += f"- To save and apply this schedule, call `generate_schedule` with date `{schedule_date}` and the following blocks:\n"
+            res += f"`{json.dumps(scheduled_blocks)}`"
+            
+            return res
+        except Exception as e:
+            print(f"[Agent Tool Error] {str(e)}")
+            return f"Error creating adaptive schedule recommendation: {str(e)}"
+
+    @llm.function_tool(description="Generate weekly study planning milestones for an upcoming exam or goal deadline (e.g. 'Exam in 14 days') and schedule them.")
+    async def generate_weekly_plan(
+        self,
+        goal_description: str,
+        target_date_iso: str,
+        subject_name: str
+    ) -> str:
+        try:
+            print(f"[Agent Tool Invoke] generate_weekly_plan for {subject_name} targeting {target_date_iso}")
+            profile = await db.get_user_profile(self.user_id)
+            tz_str = profile.get("timezone") or "Asia/Kolkata"
+            from zoneinfo import ZoneInfo
+            try:
+                user_tz = ZoneInfo(tz_str)
+            except Exception:
+                user_tz = ZoneInfo("Asia/Kolkata")
+                
+            now_local = datetime.datetime.now(user_tz).date()
+            try:
+                target_date = datetime.datetime.strptime(target_date_iso.split("T")[0], "%Y-%m-%d").date()
+            except Exception:
+                return f"Invalid target date format: '{target_date_iso}'. Please use YYYY-MM-DD."
+                
+            days_diff = (target_date - now_local).days
+            if days_diff <= 0:
+                return f"The target date {target_date_iso} is in the past or today. Cannot generate a future weekly plan."
+                
+            milestones = []
+            if days_diff <= 7:
+                milestones = [
+                    (1, f"Initial Review: Gather materials and read core chapters for {subject_name}"),
+                    (3, f"Concept Practice: Complete exercises and solve problems for {subject_name}"),
+                    (5, f"Mock Test: Time-boxed self assessment on {subject_name}"),
+                    (6, f"Revision: Final review of weak topics in {subject_name}")
+                ]
+            elif days_diff <= 14:
+                milestones = [
+                    (1, f"Plan & Syllabus: Highlight key topics of {subject_name}"),
+                    (4, f"Core Study: Deep-dive study into high-weightage chapters of {subject_name}"),
+                    (7, f"Mid-term Checkpoint: Solve past papers for {subject_name}"),
+                    (10, f"Revision & Memorization: Flashcards and key formulas for {subject_name}"),
+                    (13, f"Final Review: Full syllabus quick revision for {subject_name}")
+                ]
+            else:
+                milestones = [
+                    (1, f"Planning: Break down {subject_name} syllabus into 4 study units"),
+                    (7, f"Unit 1 & 2 Completion: Focus on foundation concepts in {subject_name}"),
+                    (14, f"Unit 3 & 4 Completion: Focus on advanced topics in {subject_name}"),
+                    (21, f"Evaluation: Full syllabus mock test and weak area review for {subject_name}"),
+                    (days_diff - 2, f"Final Revision: Wrap up study sheets and mock evaluations for {subject_name}")
+                ]
+                
+            scheduled_milestones = []
+            for day_offset, desc in milestones:
+                milestone_date = now_local + datetime.timedelta(days=day_offset)
+                if milestone_date >= target_date:
+                    continue
+                dt_local = datetime.datetime.combine(milestone_date, datetime.time(9, 0))
+                utc_iso = dt_local.replace(tzinfo=user_tz).astimezone(datetime.timezone.utc).isoformat()
+                
+                task = await db.insert_task(self.user_id, f"Milestone: {desc}", utc_iso)
+                task_id = task.get("id")
+                if task_id:
+                    await db.set_task_metadata(task_id, domain="Study", priority="HIGH")
+                
+                scheduled_milestones.append({
+                    "date": milestone_date.strftime("%Y-%m-%d"),
+                    "description": desc
+                })
+                
+            res = f"### Weekly Plan & Milestones for {subject_name} ({days_diff} days preparation)\n\n"
+            res += f"I have automatically scheduled {len(scheduled_milestones)} prep milestones directly in your daily planner:\n\n"
+            for m in scheduled_milestones:
+                res += f"- **{m['date']}**: {m['description']}\n"
+            res += f"\nDeadline: **{target_date_iso}** - {goal_description}\n"
+            res += "Good luck! You will be reminded of each milestone as the scheduled day arrives."
+            
+            return res
+        except Exception as e:
+            print(f"[Agent Tool Error] {str(e)}")
+            return f"Error generating weekly plan: {str(e)}"
+
+    @llm.function_tool(description="Adjust the user's workload for today based on their fatigue level (e.g. 'exhausted', 'tired'). Reschedules non-critical tasks and suggests rest.")
+    async def adjust_emotional_workload(
+        self,
+        fatigue_level: str,  # "exhausted", "tired", "low_energy"
+        schedule_date: str   # e.g., "2026-06-18"
+    ) -> str:
+        try:
+            print(f"[Agent Tool Invoke] adjust_emotional_workload level: {fatigue_level} for {schedule_date}")
+            all_tasks = await db.get_user_tasks(self.user_id)
+            
+            today_tasks = []
+            for t in all_tasks:
+                sched_time = t.get("scheduled_time")
+                if sched_time:
+                    profile = await db.get_user_profile(self.user_id)
+                    tz_str = profile.get("timezone") or "Asia/Kolkata"
+                    from zoneinfo import ZoneInfo
+                    try:
+                        user_tz = ZoneInfo(tz_str)
+                    except Exception:
+                        user_tz = ZoneInfo("Asia/Kolkata")
+                    
+                    dt_utc = datetime.datetime.fromisoformat(sched_time.replace("Z", "+00:00"))
+                    dt_local = dt_utc.astimezone(user_tz)
+                    if dt_local.strftime("%Y-%m-%d") == schedule_date:
+                        today_tasks.append(t)
+                        
+            if not today_tasks:
+                return f"You have no tasks scheduled for {schedule_date}. Perfect time to rest!"
+                
+            postponed_tasks = []
+            kept_tasks = []
+            
+            for task in today_tasks:
+                tid = task.get("id")
+                desc = task.get("task_description", "")
+                status = task.get("status", "pending")
+                
+                if status in ("completed", "skipped"):
+                    continue
+                    
+                meta = await db.get_task_metadata(tid)
+                priority = meta.get("priority", "MEDIUM") if meta else "MEDIUM"
+                
+                if fatigue_level.lower() in ("exhausted", "tired", "low_energy") and priority in ("MEDIUM", "LOW"):
+                    dt_utc = datetime.datetime.fromisoformat(task.get("scheduled_time").replace("Z", "+00:00"))
+                    tomorrow_utc = (dt_utc + datetime.timedelta(days=1)).isoformat()
+                    await db.delete_task(tid)
+                    new_task = await db.insert_task(self.user_id, desc, tomorrow_utc)
+                    new_tid = new_task.get("id")
+                    if new_tid:
+                        await db.set_task_metadata(new_tid, domain=meta.get("domain", "Personal") if meta else "Personal", priority=priority)
+                    
+                    postponed_tasks.append(desc)
+                else:
+                    kept_tasks.append(desc)
+                    
+            res = f"### Emotional Workload Adjustment: {fatigue_level.upper()} ({schedule_date})\n\n"
+            res += f"I've adjusted your routine to accommodate your energy level. Here is the summary:\n\n"
+            
+            if postponed_tasks:
+                res += "**Postponed Tasks (Moved to Tomorrow):**\n"
+                for p in postponed_tasks:
+                    res += f"- {p} (rescheduled to give you breathing room)\n"
+                res += "\n"
+                
+            if kept_tasks:
+                res += "**Critical Focus for Today (Kept):**\n"
+                for k in kept_tasks:
+                    res += f"- {k} (High/Critical priority task)\n"
+                res += "\n"
+            else:
+                res += "You have NO critical tasks left for today! Please focus on resting.\n\n"
+                
+            res += "**Recommendation:**\n"
+            res += "- Sleep early. I've adjusted your daily routine template to protect your rest windows.\n"
+            res += "- Stay hydrated and take a complete break from screens."
+            
+            return res
+        except Exception as e:
+            print(f"[Agent Tool Error] {str(e)}")
+            return f"Error adjusting workload: {str(e)}"
+
 import urllib.request
 import time
 
