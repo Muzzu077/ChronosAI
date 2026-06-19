@@ -42,6 +42,33 @@ app = FastAPI(
 # CORS configuration: Restrict allowed origins for security (can be configured in .env)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
+import time
+from collections import defaultdict
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, limit: int = 100, window: int = 60):
+        super().__init__(app)
+        self.limit = limit
+        self.window = window
+        self.requests = defaultdict(list)
+        
+    async def dispatch(self, request, call_next):
+        client = request.client
+        ip = client.host if client else "unknown"
+        now = time.time()
+        self.requests[ip] = [t for t in self.requests[ip] if now - t < self.window]
+        if len(self.requests[ip]) >= self.limit:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Rate limit exceeded."}
+            )
+        self.requests[ip].append(now)
+        return await call_next(request)
+
+app.add_middleware(RateLimitMiddleware, limit=100, window=60)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -305,6 +332,7 @@ def get_listen_token(
             api_key=LIVEKIT_API_KEY,
             api_secret=LIVEKIT_API_SECRET
         )
+        token.with_ttl(datetime.timedelta(minutes=15))
 
         
         grants = VideoGrants(
