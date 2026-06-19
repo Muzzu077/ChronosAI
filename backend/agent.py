@@ -1232,22 +1232,23 @@ async def entrypoint(ctx: JobContext):
     initial_ctx = llm.ChatContext()
     initial_ctx.add_message(role="system", content=system_prompt)
     
-    # Load LLM: Prefer Hugging Face Serverless Qwen 2.5 72B Instruct if HF_TOKEN is available,
-    # otherwise fall back to OpenRouter.
-    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-    if hf_token:
+    # Load LLM: Prefer OpenRouter if OPENROUTER_API_KEY is available,
+    # otherwise fall back to Hugging Face Serverless.
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        print(f"[Agent Startup] Initializing OpenRouter LLM ({OPENROUTER_MODEL})...", flush=True)
+        openrouter_llm = openai.LLM(
+            model=OPENROUTER_MODEL,
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
+    else:
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         print("[Agent Startup] Initializing Hugging Face Serverless LLM (Qwen/Qwen2.5-72B-Instruct)...", flush=True)
         openrouter_llm = openai.LLM(
             model="Qwen/Qwen2.5-72B-Instruct",
             api_key=hf_token,
             base_url="https://router.huggingface.co/v1"
-        )
-    else:
-        print("[Agent Startup] Initializing OpenRouter LLM...", flush=True)
-        openrouter_llm = openai.LLM(
-            model=OPENROUTER_MODEL,
-            api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1"
         )
     
     # Load VAD model ONCE and reuse to avoid ~200MB wasted RAM

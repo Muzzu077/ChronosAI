@@ -6,6 +6,14 @@ RUN apt-get update && apt-get install -y \
     libasound2-dev \
     portaudio19-dev \
     git \
+    ffmpeg \
+    libavdevice-dev \
+    libavfilter-dev \
+    libavformat-dev \
+    libavcodec-dev \
+    libswresample-dev \
+    libswscale-dev \
+    libavutil-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
