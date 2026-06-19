@@ -20,7 +20,9 @@ for key in ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_URL", "OPENROUTER_
         os.environ[key] = os.environ[key].strip()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash:free").strip()
+if OPENROUTER_MODEL in ["openrouter/free", "free", "openrouter", "gemini-free"]:
+    OPENROUTER_MODEL = "google/gemini-2.5-flash:free"
 
 
 

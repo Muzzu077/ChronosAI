@@ -33,7 +33,7 @@ class ApiClient {
 
         // Put your Hugging Face Space URL here (e.g. "https://username-space-name.hf.space")
         // If empty, falls back to local adb reverse (http://127.0.0.1:8080)
-        private const val CLOUD_URL = ""
+        private const val CLOUD_URL = "https://muzzu077-chronosai-backend.hf.space"
 
         private val BASE_URL: String
             get() {

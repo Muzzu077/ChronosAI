@@ -50,6 +50,7 @@ class VoiceReceiverService : Service() {
     private val pendingMessageQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
     private var connectionMessageSent = false
+    private var lastSentChatMessage: String? = null
 
     companion object {
         private const val TAG = "VoiceReceiverService"
@@ -141,6 +142,7 @@ class VoiceReceiverService : Service() {
             ACTION_SEND_CHAT -> {
                 val msg = intent.getStringExtra(EXTRA_CHAT_MESSAGE)
                 if (msg != null) {
+                    lastSentChatMessage = msg
                     sendTextMessage(msg)
                 }
             }
@@ -313,9 +315,16 @@ class VoiceReceiverService : Service() {
                                text.startsWith("SYSTEM_HANGUP")) {
                         Log.d(TAG, "Ignoring control message: $text")
                     } else {
-                        // Skip "You:" messages from data channel - already shown locally when user typed it
+                        // Skip "You:" messages from data channel only if they are duplicates of locally typed messages
                         if (text.startsWith("ChronosAI:")) {
                             activeViewModel?.updateTranscript(text)
+                        } else if (text.startsWith("You:")) {
+                            val content = text.substringAfter("You:").trim()
+                            if (lastSentChatMessage != null && content.equals(lastSentChatMessage?.trim(), ignoreCase = true)) {
+                                lastSentChatMessage = null
+                            } else {
+                                activeViewModel?.updateTranscript(text)
+                            }
                         } else if (!text.startsWith("You:")) {
                             activeViewModel?.updateTranscript("ChronosAI: $text")
                         }
