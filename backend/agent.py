@@ -935,13 +935,17 @@ async def query_tts(text, hf_token):
         import av
         import io
         
-        voice_id = (os.getenv("ELEVEN_VOICE_ID") or "Neerja").strip()
+        voice_id = (os.getenv("ELEVEN_VOICE_ID") or "Jenny").strip()
         voice_map = {
-            "Neerja": "en-IN-NeerjaNeural",
-            "Prabhat": "en-IN-PrabhatNeural",
-            "Akash": "en-IN-NeerjaNeural"
+            "Neerja": "en-US-JennyNeural",   # Map to natural Jenny
+            "Prabhat": "en-US-GuyNeural",     # Map to natural Guy
+            "Akash": "en-US-GuyNeural",       # Map to natural Guy
+            "Jenny": "en-US-JennyNeural",
+            "Guy": "en-US-GuyNeural",
+            "Brian": "en-US-BrianNeural",
+            "Aria": "en-US-AriaNeural"
         }
-        edge_voice = voice_map.get(voice_id, "en-IN-NeerjaNeural")
+        edge_voice = voice_map.get(voice_id, "en-US-JennyNeural")
         
         print(f"[edge-tts] Synthesizing speech using voice: {edge_voice}...", flush=True)
         communicate = edge_tts.Communicate(text, edge_voice)

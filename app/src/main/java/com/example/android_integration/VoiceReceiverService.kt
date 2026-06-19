@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.media.AudioDeviceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.Bundle
@@ -348,12 +349,7 @@ class VoiceReceiverService : Service() {
         Log.d(TAG, "Routing WebRTC stream to main phone speaker channel.")
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         
-        @Suppress("DEPRECATION")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.isSpeakerphoneOn = true
-        } else {
-            audioManager.isSpeakerphoneOn = true
-        }
+        setSpeakerphoneState(true)
     }
 
     private fun createNotificationChannel() {
@@ -412,7 +408,24 @@ class VoiceReceiverService : Service() {
     fun setSpeakerphoneState(isOn: Boolean) {
         try {
             val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.isSpeakerphoneOn = isOn
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (isOn) {
+                    val devices = audioManager.availableCommunicationDevices
+                    val speakerDevice = devices.find { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    if (speakerDevice != null) {
+                        val result = audioManager.setCommunicationDevice(speakerDevice)
+                        Log.d(TAG, "setCommunicationDevice(SPEAKER) result: $result")
+                    } else {
+                        Log.e(TAG, "Built-in speaker communication device not found.")
+                    }
+                } else {
+                    audioManager.clearCommunicationDevice()
+                    Log.d(TAG, "Cleared communication device")
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isSpeakerphoneOn = isOn
+            }
             Log.d(TAG, "Speakerphone state manually set to: $isOn")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to set speakerphone state", e)
