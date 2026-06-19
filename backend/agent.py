@@ -1078,8 +1078,9 @@ class HFTTSChunkedStream(tts.ChunkedStream):
         pcm_data, sample_rate, num_channels = await query_tts(text, self._tts.hf_token)
         
         # Always initialize the emitter to prevent 'AudioEmitter isn't started' crash
+        request_id = getattr(self._conn_options, "request_id", None) or "hf-tts-id"
         output_emitter.initialize(
-            request_id=self._conn_options.request_id if self._conn_options else "hf-tts-id",
+            request_id=request_id,
             sample_rate=sample_rate or 16000,
             num_channels=num_channels or 1,
             mime_type="audio/pcm"
