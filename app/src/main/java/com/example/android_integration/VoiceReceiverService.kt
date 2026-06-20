@@ -205,6 +205,12 @@ class VoiceReceiverService : Service() {
                 Log.d(TAG, "Successfully connected to LiveKit Voice Room: room-user.")
                 activeViewModel?.setVoiceSessionState(com.example.VoiceSessionState.LISTENING)
                 
+                // Allow WebRTC audio engine to stabilize, then apply speakerphone routing
+                serviceScope.launch {
+                    kotlinx.coroutines.delay(500)
+                    setSpeakerphoneState(true)
+                }
+                
                 // Flush pending messages
                 while (!pendingMessageQueue.isEmpty()) {
                     val msg = pendingMessageQueue.poll()
@@ -257,14 +263,8 @@ class VoiceReceiverService : Service() {
     private fun terminateWebRtcRoom() {
         Log.d(TAG, "Terminating LiveKit WebRTC connection context...")
         connectionMessageSent = false
-        // Restore audio mode to normal
-        try {
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.mode = AudioManager.MODE_NORMAL
-            Log.d(TAG, "Audio mode restored to MODE_NORMAL.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to restore audio mode", e)
-        }
+        // Clear communication device routing
+        setSpeakerphoneState(false)
         serviceScope.launch {
             try {
                 // Send HUNGUP signal to backend
@@ -300,6 +300,10 @@ class VoiceReceiverService : Service() {
             }
             is RoomEvent.TrackSubscribed -> {
                 Log.d(TAG, "Incoming high fidelity audio track subscribed! Route ready for voice stream.")
+                serviceScope.launch {
+                    kotlinx.coroutines.delay(300)
+                    setSpeakerphoneState(true)
+                }
             }
             is RoomEvent.DataReceived -> {
                 try {
@@ -344,12 +348,8 @@ class VoiceReceiverService : Service() {
      * 6.3 Configures the audio track to play through the device's main speaker stream
      */
     private fun configureAudioRouting() {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        
         Log.d(TAG, "Routing WebRTC stream to main phone speaker channel.")
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        
-        setSpeakerphoneState(true)
+        // WebRTC manages audio mode automatically. We set speaker state on connection.
     }
 
     private fun createNotificationChannel() {
@@ -435,13 +435,8 @@ class VoiceReceiverService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "VoiceReceiverService destroyed. Cleaning up synchronously.")
-        // Restore audio mode
-        try {
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audioManager.mode = AudioManager.MODE_NORMAL
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to restore audio mode on destroy", e)
-        }
+        // Restore audio device routing
+        setSpeakerphoneState(false)
         // Clear ViewModel references before cancelling scope
         activeViewModel?.let { vm ->
             vm.onSpeakRequested = null

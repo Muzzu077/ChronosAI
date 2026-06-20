@@ -228,7 +228,9 @@ def _sync_get_accountability_candidates(current_time_5m: str, current_time_1m: s
         return []
 
     reminded_map = {row[0]: row[1] for row in reminded_rows}
-    reminded_ids = list(reminded_map.keys())
+    reminded_ids = [rid for rid in reminded_map.keys() if not rid.startswith("checkpoint_")]
+    if not reminded_ids:
+        return []
 
     try:
         response = supabase_client.table("daily_tasks") \
